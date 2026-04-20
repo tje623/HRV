@@ -981,10 +981,10 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=8,
+        default=10,
         help=(
             "Number of parallel worker processes (spawn, ~1.5–2 GB RAM each). "
-            "Default: 8 (safe for 36 GB machines). Reduce to 4 on 16 GB systems."
+            "Default: 10 (tuned for 36 GB M3). Reduce to 4–6 on 16 GB systems."
         ),
     )
     parser.add_argument(
