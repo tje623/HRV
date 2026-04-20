@@ -1,0 +1,50 @@
+# Data files (large — never commit raw ECG or processed parquet)
+data/
+*.parquet
+*.csv
+*.json
+
+# Trained model weights
+models/*.pt
+models/*.joblib
+models/backup_*/
+models/cnn_checkpoints/
+models/cnn2d_checkpoints/
+
+# Training logs and checkpoints
+lightning_logs/
+checkpoints/
+terminal_logs/
+retrain_pipeline.log
+*.log
+*.ckpt/
+
+# Annotation output (large / personal data)
+annotation_queues/
+annotations/
+motifs/
+memory/
+reannotation_presorted.csv
+
+# Raw ECG and peak data (on external SSD)
+new_peaks/
+new_processed/
+peaks/
+processed/
+raw_ecg/
+auto_categorization/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+.venv
+
+# macOS
+.DS_Store
