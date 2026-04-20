@@ -308,45 +308,53 @@ def _extract_windows(
     sample_interval_ns = int(1e9 / SAMPLE_RATE)  # ~3 906 250 ns
     half_window = WINDOW_SIZE // 2
 
+    # ── Window extraction: vectorised per-segment (not per-beat) ─────────
+    # Outer loop is over unique segments (~few thousand per chunk), not over
+    # individual beats (~millions).  All beats in a segment are interpolated
+    # in a single np.interp call on the flattened (k×256,) target array.
+    offsets = np.arange(WINDOW_SIZE, dtype=np.int64) * sample_interval_ns  # (256,)
     n_with_data = 0
-    for i in range(n_beats):
-        seg_idx = int(peak_segment_ids[i])
-        if seg_idx not in ecg_by_seg:
-            continue  # window stays all-zeros
 
-        seg_ts, seg_ecg = ecg_by_seg[seg_idx]
+    for seg_idx, (seg_ts, seg_ecg) in ecg_by_seg.items():
         if len(seg_ts) < 2:
-            continue  # need ≥2 points for interpolation
+            continue
+        beat_mask = peak_segment_ids == seg_idx
+        if not beat_mask.any():
+            continue
 
-        peak_ts = int(peak_timestamps_ns[i])
-        t_start = peak_ts - half_window * sample_interval_ns
-        target_ts = t_start + np.arange(WINDOW_SIZE, dtype=np.int64) * sample_interval_ns
+        peak_ts_seg = peak_timestamps_ns[beat_mask]          # (k,)
+        t_starts = peak_ts_seg - half_window * sample_interval_ns  # (k,)
+        target_ts = (t_starts[:, None] + offsets[None, :]).ravel()  # (k×256,)
 
-        windows[i] = np.interp(
+        flat = np.interp(
             target_ts.astype(np.float64),
             seg_ts.astype(np.float64),
             seg_ecg,
             left=0.0,
             right=0.0,
-        ).astype(np.float32)
-        n_with_data += 1
+        )
+        windows[beat_mask] = flat.reshape(-1, WINDOW_SIZE).astype(np.float32)
+        n_with_data += int(beat_mask.sum())
 
     logger.info(
         "Window extraction: %d / %d beats have ECG data", n_with_data, n_beats
     )
 
-    # Bandpass filter (3–40 Hz, 4th-order Butterworth, zero-phase)
+    # ── Bandpass filter: vectorised in batches of 10 K windows ───────────
+    # sosfiltfilt(sos, X, axis=1) filters all rows of X simultaneously —
+    # ~100× faster than one call per beat.
     sos = butter(4, [3.0, 40.0], btype="bandpass", fs=SAMPLE_RATE, output="sos")
-    n_filtered = 0
-    for i in range(n_beats):
-        if np.any(windows[i] != 0):
-            try:
-                filtered = sosfiltfilt(sos, windows[i]).astype(np.float32)
-                if not np.any(np.isnan(filtered)):
-                    windows[i] = filtered
-                    n_filtered += 1
-            except ValueError:
-                pass  # keep unfiltered on edge cases
+    _FILTER_BATCH = 10_000
+    nonzero_idx = np.where(np.any(windows != 0, axis=1))[0]
+
+    for start in range(0, len(nonzero_idx), _FILTER_BATCH):
+        idx = nonzero_idx[start : start + _FILTER_BATCH]
+        try:
+            filtered = sosfiltfilt(sos, windows[idx], axis=1).astype(np.float32)
+            valid = ~np.any(np.isnan(filtered), axis=1)
+            windows[idx[valid]] = filtered[valid]
+        except ValueError:
+            pass  # keep unfiltered on edge cases
 
     logger.info("Bandpass filtered: %d / %d windows", n_filtered, n_beats)
     return windows
