@@ -980,60 +980,186 @@ def _cli_train(args: argparse.Namespace) -> None:
 
 
 def _cli_predict(args: argparse.Namespace) -> None:
-    """Handle the ``predict`` subcommand."""
+    """Handle the ``predict`` subcommand — streams beat_features in batches.
+
+    Loading the full beat_features_merged.parquet (54 M rows × 40+ cols)
+    into RAM at once would consume 10-20 GB and crash the machine.  This
+    implementation instead:
+      1. Loads the model artifact (~MB).
+      2. Opens beat_features.parquet for streaming via ParquetFile.
+      3. Imputes and predicts each batch independently.
+      4. Writes predictions incrementally via ParquetWriter.
+
+    Peak RAM: model + one batch (~80 MB) + one output batch.
+    """
     bf_path = Path(args.beat_features)
     if not bf_path.exists():
         logger.error("Beat features not found: %s", bf_path)
         sys.exit(1)
 
-    beat_features = pd.read_parquet(bf_path)
+    # ── Load model artifact (small) ────────────────────────────────────────
+    mpath = Path(args.model)
+    if not mpath.exists():
+        logger.error("Model not found: %s", mpath)
+        sys.exit(1)
+
+    artifact = joblib.load(mpath)
+    clf = artifact["model"]
+    feature_cols: list[str] = artifact["feature_columns"]
+    train_medians: dict[str, float] = artifact["train_medians"]
+    stored_threshold: float = artifact["optimal_threshold"]
+    trained_at: str = artifact.get("trained_at", "unknown")
+
+    threshold = args.threshold if args.threshold is not None else stored_threshold
     logger.info(
-        "Loaded %d beat features from %s", len(beat_features), bf_path
+        "Loaded model trained at %s (%d features, threshold=%.4f)",
+        trained_at,
+        len(feature_cols),
+        threshold,
     )
 
-    threshold = args.threshold if args.threshold is not None else None
-    result = predict(beat_features, args.model, threshold=threshold)
+    # ── Inspect parquet schema without loading data ────────────────────────
+    pf = pq.ParquetFile(bf_path)
+    schema_names = set(pf.schema_arrow.names)
+    n_total_rows = pf.metadata.num_rows
 
-    # Optionally add uncertainty scores
-    result = get_uncertainty_scores(result)
+    missing_cols = [c for c in feature_cols if c not in schema_names]
+    if missing_cols:
+        raise ValueError(
+            f"Feature mismatch: model expects {missing_cols} which are "
+            f"missing from {bf_path}.  Model was trained at {trained_at} "
+            f"with features: {feature_cols}"
+        )
 
-    # Save predictions
+    # Only request the columns we actually need (peak_id + feature_cols)
+    cols_to_read = list(
+        dict.fromkeys(  # preserves order, deduplicates
+            (["peak_id"] if "peak_id" in schema_names else []) + feature_cols
+        )
+    )
+
+    logger.info(
+        "Streaming tabular inference: %d rows, %d feature columns, "
+        "batch_size=%d",
+        n_total_rows,
+        len(feature_cols),
+        args.batch_size,
+    )
+
+    # ── Output setup ──────────────────────────────────────────────────────
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pandas(result, preserve_index=False)
-    pq.write_table(table, out_path, compression="snappy")
+
+    out_schema = pa.schema([
+        pa.field("peak_id",             pa.int64()),
+        pa.field("p_artifact_tabular",  pa.float32()),
+        pa.field("predicted_artifact",  pa.bool_()),
+        pa.field("uncertainty_tabular", pa.float32()),
+    ])
+
+    # Running stats (avoid accumulating all probabilities in RAM)
+    total_beats = 0
+    total_artifact = 0
+    p_min = np.inf
+    p_max = -np.inf
+    p_sum = 0.0
+    p_sq_sum = 0.0
+    u_min = np.inf
+    u_max = -np.inf
+    u_sum = 0.0
+    u_sq_sum = 0.0
+
+    with pq.ParquetWriter(out_path, out_schema, compression="snappy") as writer:
+        for batch in pf.iter_batches(
+            batch_size=args.batch_size,
+            columns=cols_to_read,
+        ):
+            df = batch.to_pandas()
+
+            # Recover peak_id — iter_batches returns it as a column
+            # (pandas index metadata is not applied to RecordBatch slices)
+            if df.index.name == "peak_id":
+                df = df.reset_index()
+            if "peak_id" not in df.columns:
+                logger.error(
+                    "peak_id not found in batch (index=%r, columns=%s)",
+                    df.index.name,
+                    list(df.columns),
+                )
+                sys.exit(1)
+
+            peak_ids = df["peak_id"].values.astype(np.int64)
+
+            # Impute NaNs with training medians then predict
+            X = _apply_median_imputation(df[feature_cols], train_medians)
+            proba = clf.predict_proba(X)[:, 1].astype(np.float32)
+            predicted = proba >= threshold
+
+            # Uncertainty: 1 − 2|p − 0.5|  (0 = confident, 1 = maximally uncertain)
+            p64 = proba.astype(np.float64)
+            uncertainty = (1.0 - 2.0 * np.abs(p64 - 0.5)).astype(np.float32)
+
+            # Accumulate stats
+            total_beats += len(proba)
+            total_artifact += int(predicted.sum())
+            if len(proba) > 0:
+                p_min = min(p_min, float(proba.min()))
+                p_max = max(p_max, float(proba.max()))
+                p_sum += float(proba.sum())
+                p_sq_sum += float((p64 ** 2).sum())
+                u_min = min(u_min, float(uncertainty.min()))
+                u_max = max(u_max, float(uncertainty.max()))
+                u_sum += float(uncertainty.sum())
+                u_sq_sum += float((uncertainty.astype(np.float64) ** 2).sum())
+
+            writer.write_table(
+                pa.table(
+                    {
+                        "peak_id":             peak_ids,
+                        "p_artifact_tabular":  proba,
+                        "predicted_artifact":  predicted,
+                        "uncertainty_tabular": uncertainty,
+                    },
+                    schema=out_schema,
+                )
+            )
+
+            logger.info(
+                "  %d / %d rows  (%.0f%%)",
+                total_beats,
+                n_total_rows,
+                100.0 * total_beats / max(n_total_rows, 1),
+            )
+
     logger.info("Saved predictions → %s", out_path)
 
-    # Print summary
+    # ── Print summary ──────────────────────────────────────────────────────
+    n_clean = total_beats - total_artifact
+    pct_artifact = 100.0 * total_artifact / max(total_beats, 1)
+
+    p_mean = p_sum / max(total_beats, 1)
+    p_std = float(np.sqrt(max(0.0, p_sq_sum / max(total_beats, 1) - p_mean ** 2)))
+    u_mean = u_sum / max(total_beats, 1)
+    u_std = float(np.sqrt(max(0.0, u_sq_sum / max(total_beats, 1) - u_mean ** 2)))
+
     print(f"\n{'=' * 72}")
     print("  Beat Artifact Tabular Predictions")
     print(f"{'=' * 72}")
-    print(f"  Total beats: {len(result):,}")
-    n_artifact = int(result["predicted_artifact"].sum())
-    n_clean = len(result) - n_artifact
-    pct_artifact = 100.0 * n_artifact / max(len(result), 1)
+    print(f"  Total beats: {total_beats:,}")
     print(f"\n  Prediction distribution:")
     print(f"    clean (predicted):    {n_clean:>8,}  ({100.0 - pct_artifact:5.1f}%)")
-    print(f"    artifact (predicted): {n_artifact:>8,}  ({pct_artifact:5.1f}%)")
-
+    print(f"    artifact (predicted): {total_artifact:>8,}  ({pct_artifact:5.1f}%)")
     print(f"\n  Probability statistics (p_artifact_tabular):")
-    p = result["p_artifact_tabular"]
     print(
-        f"    mean={p.mean():.4f}  std={p.std():.4f}  "
-        f"min={p.min():.4f}  max={p.max():.4f}"
+        f"    mean={p_mean:.4f}  std={p_std:.4f}  "
+        f"min={p_min:.4f}  max={p_max:.4f}"
     )
-
     print(f"\n  Uncertainty statistics (uncertainty_tabular):")
-    u = result["uncertainty_tabular"]
     print(
-        f"    mean={u.mean():.4f}  std={u.std():.4f}  "
-        f"min={u.min():.4f}  max={u.max():.4f}"
+        f"    mean={u_mean:.4f}  std={u_std:.4f}  "
+        f"min={u_min:.4f}  max={u_max:.4f}"
     )
-
-    print(f"\n  First 5 rows:")
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 200)
-    print(result.head(5).to_string(index=False))
+    print(f"\n  Output: {out_path}")
     print(f"{'=' * 72}\n")
 
 
@@ -1121,6 +1247,15 @@ def main() -> None:
         type=float,
         default=None,
         help="Classification threshold (default: use stored optimal)",
+    )
+    predict_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500_000,
+        help=(
+            "Rows per streaming batch (default: 500 000 ≈ 80 MB/batch). "
+            "Decrease if RAM is tight."
+        ),
     )
 
     args = parser.parse_args()

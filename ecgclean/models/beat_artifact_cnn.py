@@ -356,7 +356,11 @@ def _extract_windows(
         except ValueError:
             pass  # keep unfiltered on edge cases
 
-    logger.info("Bandpass filtered: %d / %d windows", n_filtered, n_beats)
+    logger.info(
+        "Bandpass filtered: %d / %d windows",
+        len(nonzero_idx),
+        n_beats,
+    )
     return windows
 
 
@@ -1271,12 +1275,28 @@ def _cli_predict(args: argparse.Namespace) -> None:
         trained_at, n_tabular, device,
     )
 
-    # ── Load small tables into RAM ────────────────────────────────────────
-    # ecg_samples.parquet is NOT loaded here — streamed per chunk below
-    beat_features = pd.read_parquet(bf_path)
-    peaks_df = pd.read_parquet(peaks_path)
+    # ── Load only the columns we actually need ────────────────────────────
+    # beat_features_merged has 40+ columns; the CNN only uses 22 tabular cols.
+    # Loading all columns would waste ~5 GB unnecessarily.
+    # ecg_samples.parquet is NOT loaded here — it is streamed per chunk below.
+    bf_schema_names = set(pq.read_schema(bf_path).names)
+    needed_bf_cols = [
+        c for c in (["peak_id"] + tabular_cols)
+        if c in bf_schema_names
+    ]
+    beat_features = pq.read_table(bf_path, columns=needed_bf_cols).to_pandas()
+
+    # Only the three columns needed to join and drive the segment chunking
+    peaks_df = pq.read_table(
+        peaks_path,
+        columns=["peak_id", "timestamp_ns", "segment_idx"],
+    ).to_pandas()
+
     logger.info(
-        "Loaded %d beat features, %d peaks", len(beat_features), len(peaks_df)
+        "Loaded %d beat features (%d cols), %d peaks",
+        len(beat_features),
+        len(beat_features.columns),
+        len(peaks_df),
     )
 
     df = beat_features.copy()
