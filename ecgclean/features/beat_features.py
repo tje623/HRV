@@ -73,7 +73,6 @@ _MIN_TEMPLATE_BEATS: int = 3
 _PEAK_SNAP_SAMPLES: int = 8   # ±8 samples = ±62ms at 130 Hz
 
 # Fork-shared globals dict for multiprocessing workers
-_G: dict = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -501,10 +500,19 @@ def _compute_signal_quality_features(ecg_windows: np.ndarray) -> dict[str, np.nd
     window_iqr = (pcts[0] - pcts[1]).astype(np.float32)
 
     # ── Kurtosis (Fisher; normal distribution = 0) ────────────────────────
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        window_kurtosis = scipy_kurtosis(w, axis=1, fisher=True)
-    window_kurtosis = np.nan_to_num(window_kurtosis, nan=0.0).astype(np.float32)
+    # Flat windows (disconnected sensor / saturated ADC) have variance ≈ 0,
+    # making kurtosis numerically undefined.  Detect them explicitly and assign
+    # 0.0 rather than silently swallowing a RuntimeWarning.
+    w_std = w.std(axis=1)
+    flat_mask = w_std < 1e-6
+    window_kurtosis = np.zeros(n, dtype=np.float32)
+    if not flat_mask.all():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            kvals = scipy_kurtosis(w[~flat_mask], axis=1, fisher=True)
+        window_kurtosis[~flat_mask] = np.nan_to_num(
+            kvals, nan=0.0, posinf=0.0, neginf=0.0
+        ).astype(np.float32)
 
     # ── Zero-crossing rate on mean-subtracted window ──────────────────────
     w_centered = w - w.mean(axis=1, keepdims=True)          # (n, 64)
@@ -831,48 +839,81 @@ def _load_ecg_windows_from_peaks_csv(
 
 
 def _process_chunk_worker(task: dict) -> tuple[int, str]:
-    """Worker function for parallel chunk processing.
+    """Worker function for parallel chunk processing (spawn-safe).
 
-    Reads shared data from module-level ``_G`` dict (populated before forking),
-    processes one chunk of segments, writes result to a checkpoint parquet file,
-    and returns ``(chunk_num, ckpt_path_str)``.
+    Each worker is a fresh process (no inherited parent memory).  It loads
+    only its own chunk's data from disk via PyArrow predicate pushdown, so
+    peak RAM per worker is ~1.5 GB regardless of dataset size.
 
     Args:
         task: Dict with keys:
-            chunk_num (int), chunk_segs (list[int]), ckpt_path (str).
+            chunk_num (int), n_chunks (int), seg_min (int), seg_max (int),
+            peaks_path (str), labels_path (str), ecg_samples_path (str),
+            segments_df (pd.DataFrame), seg_quality (pd.DataFrame | None),
+            ckpt_path (str).
 
     Returns:
         Tuple of (chunk_num, ckpt_path_str).
     """
-    chunk_num: int = task["chunk_num"]
-    chunk_segs: list[int] = task["chunk_segs"]
-    ckpt_path: str = task["ckpt_path"]
+    chunk_num: int       = task["chunk_num"]
+    n_chunks: int        = task["n_chunks"]
+    seg_min: int         = task["seg_min"]
+    seg_max: int         = task["seg_max"]
+    peaks_path: str      = task["peaks_path"]
+    labels_path: str     = task["labels_path"]
+    ecg_samples_path: str = task["ecg_samples_path"]
+    segments_df: pd.DataFrame          = task["segments_df"]
+    seg_quality: pd.DataFrame | None   = task["seg_quality"]
+    ckpt_path: str       = task["ckpt_path"]
 
-    peaks_sorted = _G["peaks_sorted"]
-    seg_arr = _G["seg_arr"]
-    labels_indexed = _G["labels_indexed"]
-    segments_df = _G["segments_df"]
-    seg_quality = _G["seg_quality"]
-    ecg_samples_path = _G["ecg_samples_path"]
-
-    seg_min = int(chunk_segs[0])
-    seg_max = int(chunk_segs[-1])
-
-    # O(log n) slice into pre-sorted peaks
-    lo = int(np.searchsorted(seg_arr, seg_min, side="left"))
-    hi = int(np.searchsorted(seg_arr, seg_max + 1, side="left"))
-    chunk_peaks = peaks_sorted.iloc[lo:hi].copy()
+    # ── Load only this chunk's peaks via predicate pushdown ───────────────
+    chunk_peaks = (
+        pq.read_table(
+            peaks_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+        )
+        .to_pandas()
+        .sort_values("timestamp_ns")
+        .reset_index(drop=True)
+    )
 
     if len(chunk_peaks) == 0:
-        # Write empty parquet so the checkpoint file exists
         empty_table = pa.table({})
         pq.write_table(empty_table, ckpt_path)
         return (chunk_num, ckpt_path)
 
-    # Reindex labels from shared index
-    chunk_labels = labels_indexed.reindex(chunk_peaks["peak_id"]).reset_index()
+    logger.info(
+        "[%d/%d] Segments %d–%d | %d peaks",
+        chunk_num, n_chunks, seg_min, seg_max, len(chunk_peaks),
+    )
 
-    # Read ECG samples for this segment range via predicate pushdown
+    # ── Load labels for this chunk via timestamp range ────────────────────
+    # labels.parquet is written in peak (timestamp) order, so timestamp_ns
+    # predicate pushdown skips unneeded row groups efficiently.
+    ts_min = int(chunk_peaks["timestamp_ns"].min())
+    ts_max = int(chunk_peaks["timestamp_ns"].max())
+    chunk_labels_raw = (
+        pq.read_table(
+            labels_path,
+            filters=[
+                ("timestamp_ns", ">=", ts_min),
+                ("timestamp_ns", "<=", ts_max),
+            ],
+        )
+        .to_pandas()
+    )
+    # Align exactly to chunk_peaks order via peak_id join
+    chunk_labels = (
+        chunk_labels_raw.set_index("peak_id")
+        .reindex(chunk_peaks["peak_id"])
+        .reset_index()
+    )
+    del chunk_labels_raw
+
+    # ── Read ECG samples for this segment range ───────────────────────────
     ecg_chunk = (
         pq.read_table(
             ecg_samples_path,
@@ -898,6 +939,10 @@ def _process_chunk_worker(task: dict) -> tuple[int, str]:
     table = pa.Table.from_pandas(result_chunk, preserve_index=True)
     pq.write_table(table, ckpt_path, compression="snappy")
 
+    logger.info(
+        "  [%d/%d] wrote %d beats → %s",
+        chunk_num, n_chunks, len(result_chunk), ckpt_path,
+    )
     return (chunk_num, ckpt_path)
 
 
@@ -936,10 +981,10 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(8, max(1, (os.cpu_count() or 1) - 1)),
+        default=4,
         help=(
-            "Number of parallel worker processes. "
-            "Default: min(8, max(1, cpu_count - 1))."
+            "Number of parallel worker processes (spawn, ~1.5–2 GB RAM each). "
+            "Default: 4 (safe for 16 GB machines). Increase to 8+ on 32 GB+."
         ),
     )
     parser.add_argument(
@@ -966,20 +1011,26 @@ def main() -> None:
             logger.error("Required file not found: %s", p)
             sys.exit(1)
 
-    # Load the small tables into RAM.  ecg_samples is intentionally NOT loaded
-    # here — it is read in segment-range chunks below to avoid OOM.
-    logger.info("Loading peaks, labels, segments from %s", proc)
-    peaks_df = pd.read_parquet(proc / "peaks.parquet")
-    labels_df = pd.read_parquet(proc / "labels.parquet")
-    segments_df = pd.read_parquet(proc / "segments.parquet")
-    logger.info(
-        "Loaded: %d peaks, %d labels, %d segments",
-        len(peaks_df), len(labels_df), len(segments_df),
+    peaks_path      = str(proc / "peaks.parquet")
+    labels_path     = str(proc / "labels.parquet")
+    ecg_samples_path = str(proc / "ecg_samples.parquet")
+
+    # Load only the segment_idx column to plan chunks (~200 MB vs ~9 GB for
+    # full peaks+labels).  Workers load their own slices from disk.
+    logger.info("Scanning segment index from %s", peaks_path)
+    seg_idx_series = (
+        pq.read_table(peaks_path, columns=["segment_idx"])
+        .to_pandas()["segment_idx"]
     )
+    all_segs   = sorted(seg_idx_series.unique())
+    total_segs = len(all_segs)
+    logger.info("Found %d unique segments across %d peaks", total_segs, len(seg_idx_series))
+    del seg_idx_series
 
-    ecg_samples_path = proc / "ecg_samples.parquet"
+    # segments_df and seg_quality are small — load them once and include in
+    # each task dict so workers don't need a separate file read.
+    segments_df = pd.read_parquet(proc / "segments.parquet")
 
-    # Optional segment quality predictions
     seg_quality: pd.DataFrame | None = None
     if args.segment_quality_preds:
         sqp = Path(args.segment_quality_preds)
@@ -989,15 +1040,7 @@ def main() -> None:
         else:
             logger.warning("--segment-quality-preds path not found: %s", sqp)
 
-    # Sort peaks by segment_idx once so each chunk is a contiguous slice.
-    peaks_sorted = peaks_df.sort_values("segment_idx").reset_index(drop=True)
-    seg_arr = peaks_sorted["segment_idx"].values
-    labels_indexed = labels_df.set_index("peak_id")
-
-    all_segs = sorted(peaks_sorted["segment_idx"].unique())
-    total_segs = len(all_segs)
     chunk_size = args.chunk_segments
-
     out_path = Path(args.output) if args.output else proc / "beat_features.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1037,25 +1080,27 @@ def main() -> None:
             continue
         chunk_segs = all_segs[chunk_start: chunk_start + chunk_size]
         tasks.append({
-            "chunk_num": chunk_num,
-            "chunk_segs": chunk_segs,
-            "ckpt_path": ckpt_path,
+            "chunk_num":       chunk_num,
+            "n_chunks":        n_chunks,
+            "seg_min":         int(chunk_segs[0]),
+            "seg_max":         int(chunk_segs[-1]),
+            "peaks_path":      peaks_path,
+            "labels_path":     labels_path,
+            "ecg_samples_path": ecg_samples_path,
+            "segments_df":     segments_df,
+            "seg_quality":     seg_quality,
+            "ckpt_path":       ckpt_path,
         })
 
-    # ── Populate fork-shared globals ──────────────────────────────────────
-    _G["peaks_sorted"] = peaks_sorted
-    _G["seg_arr"] = seg_arr
-    _G["labels_indexed"] = labels_indexed
-    _G["segments_df"] = segments_df
-    _G["seg_quality"] = seg_quality
-    _G["ecg_samples_path"] = str(ecg_samples_path)
-
-    # ── Dispatch tasks ────────────────────────────────────────────────────
+    # ── Dispatch tasks (spawn — each worker starts fresh, ~1.5 GB RAM each) ─
     completed: list[tuple[int, str]] = []
 
     if args.workers > 1 and tasks:
-        logger.info("Using %d worker processes (fork)", args.workers)
-        mp_ctx = multiprocessing.get_context("fork")
+        logger.info(
+            "Using %d worker processes (spawn) — peak RAM ≈ %d GB",
+            args.workers, args.workers * 2,
+        )
+        mp_ctx = multiprocessing.get_context("spawn")
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=args.workers,
             mp_context=mp_ctx,
@@ -1065,20 +1110,11 @@ def main() -> None:
             }
             for future in concurrent.futures.as_completed(future_to_task):
                 chunk_num, ckpt_path = future.result()
-                logger.info(
-                    "[%d/%d] Checkpoint written → %s",
-                    chunk_num, n_chunks, ckpt_path,
-                )
                 completed.append((chunk_num, ckpt_path))
     else:
-        if args.workers <= 1:
-            logger.info("Running serially (workers=1)")
+        logger.info("Running serially (workers=1)")
         for t in tasks:
             chunk_num, ckpt_path = _process_chunk_worker(t)
-            logger.info(
-                "[%d/%d] Checkpoint written → %s",
-                chunk_num, n_chunks, ckpt_path,
-            )
             completed.append((chunk_num, ckpt_path))
 
     # ── Assemble all checkpoints in order into final output ───────────────

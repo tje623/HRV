@@ -200,6 +200,17 @@ Two incompatible label namespaces exist in older files. V1 raw labels: `1–9` (
 - `annotation_ai_annotator.py`, `marker_ai_annotator.py` — AI-assisted annotation helpers
 - `beat_reannotator.py` — re-annotate beats in bulk
 
+## GitHub
+
+All scripts are tracked in the [tje623/HRV](https://github.com/tje623/HRV) repo.
+**After every script edit, commit and push the change:**
+```bash
+cd "/Volumes/xHRV/Artifact Detector"
+git add <changed files>
+git commit -m "short description"
+git push
+```
+
 ## Detailed Documentation
 
 Stage-by-stage guides are in `guides/`:
