@@ -70,9 +70,17 @@ MIN_VALIDATED_BEATS_CLEAN: int = 10               # minimum clean beats for "cle
 
 # ECG polarity correction: if median amplitude at dominant peaks < this → inverted.
 # Applied per file in _process_one_ecg_file.
-_ECG_INVERSION_THRESHOLD: float = -0.5   # mV
+# -0.3 mV rationale: Polar H10 R-peaks are typically 0.5-1.5 mV; noise floor is
+# ~0.05-0.1 mV peak.  -0.3 mV is 3-6× the noise floor (near-zero false-positive
+# rate) while catching any genuine inversion where R-peaks reach ≥0.3 mV magnitude.
+_ECG_INVERSION_THRESHOLD: float = -0.3   # mV
 _ECG_INVERSION_WINDOW_SEC: float = 1.0    # split into 1-second windows for detection
-_ECG_INVERSION_MIN_WINDOWS: int = 50       # need at least this many windows to decide
+_ECG_INVERSION_MIN_WINDOWS: int = 20       # minimum windows required to make a decision
+# Polarity sampling: read 1 in every N original rows.
+# Step=10 → one sample per 80 ms at 125 Hz → ~12-13 sparse samples per 1-second window.
+# That preserves enough density for argmax-per-window polarity detection while scanning
+# only 10% of the file's rows (≈1-2 MB of parse work for a typical 163 MB file).
+_ECG_POLARITY_SAMPLE_STEP: int = 10
 
 logging.basicConfig(
     level=logging.INFO,
@@ -569,29 +577,38 @@ def _process_one_ecg_file(
     if ecg_col is None:
         ecg_col = header_df.columns[1]
 
-    # ── Step 2: small sample to determine ts format, fs, and polarity ─────
-    sample_df  = pd.read_csv(csv_path, nrows=10_000)
-    sample_val = sample_df[ts_col].iloc[0]
+    # ── Step 2a: small consecutive sample → ts format + fs estimation ─────────
+    # Only needs a few hundred consecutive rows; larger reads waste time here.
+    _fmt_sample = pd.read_csv(csv_path, nrows=1_000)
+    sample_val   = _fmt_sample[ts_col].iloc[0]
     ts_is_string = isinstance(sample_val, str)
 
-    # Estimate sampling frequency from first 1000 valid timestamp gaps
     if ts_is_string:
-        _sample_ts = sample_df[ts_col].head(1000).apply(parse_timestamp_to_ns).dropna().values.astype(np.int64)
+        _sample_ts = _fmt_sample[ts_col].apply(parse_timestamp_to_ns).dropna().values.astype(np.int64)
     else:
-        _sample_ts = sample_df[ts_col].head(1000).values.astype(np.int64) * MS_TO_NS
+        _sample_ts = _fmt_sample[ts_col].values.astype(np.int64) * MS_TO_NS
     _fs_est = 60.0  # fallback
     if len(_sample_ts) > 1:
         _fs_est = 1e9 / float(np.median(np.diff(_sample_ts)))
 
-    # Polarity check on the sample (10K rows ≈ 77 seconds at 130 Hz → 77 windows)
+    # ── Step 2b: file-wide evenly-spaced sample → polarity detection ──────────
+    # Read every _ECG_POLARITY_SAMPLE_STEP-th row so that the sample spans the
+    # entire recording, not just the opening minutes.  pandas scans the file once
+    # (skipping parse on unselected rows) so this is roughly one sequential read.
+    _pol_sample = pd.read_csv(
+        csv_path,
+        usecols=[ts_col, ecg_col],
+        skiprows=lambda i: i > 0 and i % _ECG_POLARITY_SAMPLE_STEP != 0,
+    )
+
     if ts_is_string:
-        _s_ts_ser = sample_df[ts_col].apply(parse_timestamp_to_ns)
+        _s_ts_ser = _pol_sample[ts_col].apply(parse_timestamp_to_ns)
         _s_valid  = _s_ts_ser.notna()
         _s_ts     = _s_ts_ser[_s_valid].values.astype(np.int64)
-        _s_ecg    = pd.to_numeric(sample_df.loc[_s_valid, ecg_col], errors="coerce").values.astype(np.float32)
+        _s_ecg    = pd.to_numeric(_pol_sample.loc[_s_valid, ecg_col], errors="coerce").values.astype(np.float32)
     else:
-        _s_ts   = sample_df[ts_col].values.astype(np.int64) * MS_TO_NS
-        _s_raw  = pd.to_numeric(sample_df[ecg_col], errors="coerce").values
+        _s_ts   = _pol_sample[ts_col].values.astype(np.int64) * MS_TO_NS
+        _s_raw  = pd.to_numeric(_pol_sample[ecg_col], errors="coerce").values
         _s_fin  = np.isfinite(_s_raw)
         _s_ts   = _s_ts[_s_fin]
         _s_ecg  = _s_raw[_s_fin].astype(np.float32)
@@ -600,47 +617,59 @@ def _process_one_ecg_file(
     _s_ecg = _s_ecg[_s_valid_ts]
 
     invert = False
-    _win = max(1, int(_ECG_INVERSION_WINDOW_SEC * _fs_est))
-    _nw  = len(_s_ecg) // _win
+    # Window size in sparse-sample space: _ECG_INVERSION_WINDOW_SEC of real time
+    # spans (_fs_est * _ECG_INVERSION_WINDOW_SEC / _ECG_POLARITY_SAMPLE_STEP) sparse rows.
+    # At step=10, fs=125: 125/10 = ~12-13 sparse samples per 1-second window.
+    _sparse_win = max(3, round(_fs_est * _ECG_INVERSION_WINDOW_SEC / _ECG_POLARITY_SAMPLE_STEP))
+    _nw = len(_s_ecg) // _sparse_win
+    logger.info(
+        "  [polarity] %s — sampled %d rows (1 in %d) spanning full file → %d windows",
+        csv_path.name, len(_s_ecg), _ECG_POLARITY_SAMPLE_STEP, _nw,
+    )
     if _nw >= _ECG_INVERSION_MIN_WINDOWS:
+        # Dominant amplitude per window: value at argmax(abs) within each sparse window
         _dom = np.array([
-            _s_ecg[w * _win + int(np.argmax(np.abs(_s_ecg[w * _win:(w + 1) * _win])))]
+            _s_ecg[w * _sparse_win + int(np.argmax(np.abs(_s_ecg[w * _sparse_win:(w + 1) * _sparse_win])))]
             for w in range(_nw)
         ])
         _dom_median = float(np.median(_dom))
         _dom_p10    = float(np.percentile(_dom, 10))
         _dom_p90    = float(np.percentile(_dom, 90))
+        logger.info(
+            "  [polarity] %s — dominant-amplitude median=%.4f mV, p10=%.4f, p90=%.4f",
+            csv_path.name, _dom_median, _dom_p10, _dom_p90,
+        )
         if _dom_median < _ECG_INVERSION_THRESHOLD:
             logger.info(
-                "  [polarity] %s — INVERTING sign  "
-                "(median_dominant=%.4f mV, p10=%.4f, p90=%.4f, windows=%d, threshold=%.4f)",
-                csv_path.name, _dom_median, _dom_p10, _dom_p90, _nw, _ECG_INVERSION_THRESHOLD,
+                "  [polarity] %s — INVERTING sign  (threshold=%.3f mV)",
+                csv_path.name, _ECG_INVERSION_THRESHOLD,
             )
             invert = True
             # ── Diagnostic PNG ────────────────────────────────────────────────
-            # Save first ~10 seconds of ECG to a PNG so you can manually verify
-            # the flip decision.  Written to <output_dir>/diagnostics/polarity/.
             try:
                 import matplotlib
                 matplotlib.use("Agg")
                 import matplotlib.pyplot as plt
                 _diag_dir = staging_path.parent.parent / "diagnostics" / "polarity"
                 _diag_dir.mkdir(parents=True, exist_ok=True)
-                _plot_samples = min(len(_s_ecg), int(10 * _fs_est))
-                _t_sec = np.arange(_plot_samples) / _fs_est
+                # Plot the dominant-amplitude distribution across the full recording
+                _t_approx = np.arange(_nw) * _ECG_INVERSION_WINDOW_SEC
                 fig, ax = plt.subplots(figsize=(14, 3))
-                ax.plot(_t_sec, _s_ecg[:_plot_samples], lw=0.6, color="steelblue")
+                ax.plot(_t_approx, _dom, lw=0.5, color="steelblue", alpha=0.8)
                 ax.axhline(0, color="gray", lw=0.5, ls="--")
+                ax.axhline(_dom_median, color="red", lw=0.8, ls="--",
+                           label=f"median={_dom_median:.3f} mV")
+                ax.axhline(_ECG_INVERSION_THRESHOLD, color="orange", lw=0.8, ls=":",
+                           label=f"threshold={_ECG_INVERSION_THRESHOLD:.3f} mV")
+                ax.legend(fontsize=8)
                 ax.set_title(
                     f"{csv_path.name}  →  INVERTED (sign will be flipped)\n"
-                    f"median_dominant={_dom_median:.4f} mV  "
-                    f"p10={_dom_p10:.4f}  p90={_dom_p90:.4f}  "
-                    f"windows={_nw}  threshold={_ECG_INVERSION_THRESHOLD}",
+                    f"dominant-amp median={_dom_median:.4f} mV  p10={_dom_p10:.4f}  "
+                    f"p90={_dom_p90:.4f}  windows={_nw}  sample_step=1/{_ECG_POLARITY_SAMPLE_STEP}",
                     fontsize=9,
                 )
-                ax.set_xlabel("Time (s)")
-                ax.set_ylabel("ECG (mV)")
-                ax.set_xlim(0, _t_sec[-1])
+                ax.set_xlabel("Approx. position (s, uniform sample)")
+                ax.set_ylabel("Dominant ECG amplitude (mV)")
                 fig.tight_layout()
                 _png_path = _diag_dir / (csv_path.stem + "_polarity_check.png")
                 fig.savefig(_png_path, dpi=100)
@@ -650,9 +679,8 @@ def _process_one_ecg_file(
                 logger.warning("  [polarity] could not save diagnostic PNG: %s", _png_err)
         else:
             logger.info(
-                "  [polarity] %s — OK  "
-                "(median_dominant=%.4f mV, p10=%.4f, p90=%.4f, windows=%d)",
-                csv_path.name, _dom_median, _dom_p10, _dom_p90, _nw,
+                "  [polarity] %s — OK  (threshold=%.3f mV)",
+                csv_path.name, _ECG_INVERSION_THRESHOLD,
             )
 
     # ── Step 3: stream full CSV in chunks → ParquetWriter ─────────────────
