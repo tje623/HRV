@@ -441,14 +441,20 @@ def compute_segment_feature_matrix(
         len(all_seg_idx), n_peaks, len(ecg_samples_df),
     )
 
+    # Pre-group merged by segment_idx — avoids O(n_segments * n_peaks) boolean scan
+    beats_by_seg = {
+        seg: grp for seg, grp in merged.groupby("segment_idx", sort=False)
+    }
+
     records: list[dict[str, float]] = []
+    _empty_beats = merged.iloc[:0]  # zero-row DataFrame with correct columns
 
     for seg_idx in all_seg_idx:
         seg_int = int(seg_idx)
         row: dict[str, float] = {"segment_idx": float(seg_int)}
 
         # ── Get beats in this segment ─────────────────────────────────────
-        seg_beats = merged[merged["segment_idx"] == seg_idx]
+        seg_beats = beats_by_seg.get(seg_idx, _empty_beats)
         not_hard = seg_beats[~seg_beats["hard_filtered"]]
 
         rr_ms = not_hard["rr_prev_ms"].values.astype(np.float64)
@@ -665,9 +671,13 @@ def main() -> None:
         # Build ECG windows for the peaks in this chunk
         chunk_windows = _load_ecg_windows(chunk_peaks, ecg_chunk)
 
+        # Filter labels to only peaks in this chunk — avoids merging all 50M rows
+        chunk_label_ids = set(chunk_peaks["peak_id"])
+        chunk_labels = labels_df[labels_df["peak_id"].isin(chunk_label_ids)]
+
         # Compute all five feature groups for these segments
         result_chunk = compute_segment_feature_matrix(
-            chunk_peaks, labels_df, ecg_chunk, chunk_windows
+            chunk_peaks, chunk_labels, ecg_chunk, chunk_windows
         )
         del ecg_chunk, chunk_windows
 
