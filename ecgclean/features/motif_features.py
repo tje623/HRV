@@ -6,11 +6,12 @@ Discover recurring ECG waveform patterns (motifs) via k-means clustering
 and compute distance-based anomaly features for each beat.
 
 Two motif families:
-    1. **QRS motifs** — cluster 64-sample beat windows by morphology
-    2. **RR motifs**  — cluster sliding windows of 10 consecutive RR intervals
+    1. **QRS motifs** — cluster 65-sample (0.5 s @ 130 Hz) beat windows by
+       morphology.
+    2. **RR motifs**  — cluster sliding windows of 10 consecutive RR intervals.
 
 These features tell downstream models how unusual each beat is relative
-to the patient's full ECG history — a powerful signal for anomaly detection.
+to the patient's full ECG history.
 
 CLI
 ---
@@ -44,26 +45,50 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MOTIF_VERSION = "1.0"
+MOTIF_VERSION = "2.0"
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
 
-# Ensure project root is on sys.path for loading beat_features window helper
+# Polar H10 ECG sampling rate — do NOT change to 256 or 512.
+SAMPLE_RATE: int = 130
+
+# QRS morphology window: 65 samples = exactly 0.5 s at 130 Hz.
+# Captures full P-QRS-T complex centered on the R-peak.
+QRS_WINDOW_SIZE: int = 65
+
+# Patient-specific HR thresholds derived from the actual 14-month HR distribution:
+#   median ~100 BPM,  q5 ~72 BPM,  q95 ~140 BPM
+#   HR routinely reaches ~186 BPM (shower) and into the 190s — these are
+#   genuine physiology for this POTS patient, NOT artifact indicators.
+HR_BRADY_BPM: float = 70.0    # below this = genuinely low for this patient
+HR_TACHY_BPM: float = 130.0   # above this = POTS tachycardia (still real physiology)
+
+# Fallback RR interval when all values are NaN.
+# 600 ms ≈ 100 BPM — patient's actual median.  (Old value was 800 ms = 75 BPM, wrong.)
+RR_FALLBACK_MS: float = 600.0
+
+# POTS ramp detection thresholds:
+#   A POTS transition is a progressive, sustained HR acceleration.
+#   Identified when a 10-beat RR window is mostly decreasing AND has contracted
+#   by at least POTS_MIN_RR_DECLINE_MS milliseconds total.
+POTS_MIN_FRAC_DECREASING: float = 0.65
+POTS_MIN_RR_DECLINE_MS: float = 150.0   # ~25 BPM rise at 80→105 BPM
+POTS_MIN_FRAC_INCREASING: float = 0.65
+POTS_MIN_RR_RECOVERY_MS: float = 150.0
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
 # ===================================================================== #
-#  ECG window extraction (reuse pattern from beat_features.py)          #
+#  ECG window extraction                                                #
 # ===================================================================== #
 def _load_ecg_windows(
     peaks_df: pd.DataFrame,
     ecg_samples_path: str,
-    window_size: int = 64,
+    window_size: int = QRS_WINDOW_SIZE,
 ) -> np.ndarray:
-    """Extract ECG windows centered on each peak.
-
-    Uses the same binary-search algorithm as ``beat_features.py``.
+    """Extract ECG windows centered on each R-peak.
 
     Parameters
     ----------
@@ -72,7 +97,7 @@ def _load_ecg_windows(
     ecg_samples_path : str
         Path to ``ecg_samples.parquet``.
     window_size : int
-        Number of samples per window (default 64).
+        Number of samples per window (default ``QRS_WINDOW_SIZE`` = 65).
 
     Returns
     -------
@@ -121,23 +146,8 @@ def _load_ecg_windows(
 #  Sparkline rendering                                                  #
 # ===================================================================== #
 def _sparkline(values: np.ndarray, width: int = 40) -> str:
-    """Render a 1-D signal as a sparkline using Unicode block chars.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        1-D signal to render.
-    width : int
-        Character width of the sparkline.
-
-    Returns
-    -------
-    str
-        Unicode sparkline string.
-    """
     if len(values) == 0:
         return ""
-    # Resample to target width
     if len(values) > width:
         indices = np.linspace(0, len(values) - 1, width).astype(int)
         values = values[indices]
@@ -149,9 +159,42 @@ def _sparkline(values: np.ndarray, width: int = 40) -> str:
     if vmax - vmin < 1e-10:
         return SPARKLINE_CHARS[4] * width
 
-    # Scale to [0, len(SPARKLINE_CHARS)-1]
     scaled = (values - vmin) / (vmax - vmin) * (len(SPARKLINE_CHARS) - 1)
     return "".join(SPARKLINE_CHARS[int(np.clip(v, 0, len(SPARKLINE_CHARS) - 1))] for v in scaled)
+
+
+# ===================================================================== #
+#  POTS transition detection (RR-dynamics only)                         #
+# ===================================================================== #
+def _detect_rr_pattern(centroid: np.ndarray) -> str:
+    """Classify an RR-interval window centroid by its temporal dynamics.
+
+    Detection is based solely on RR interval sequences — NOT on physiological
+    event annotations (which mark PACs/PVCs/vagal events, not POTS transitions).
+
+    A POTS ramp-up is identified by:
+      - Majority of consecutive RR pairs are decreasing (HR accelerating)
+      - Total RR contraction over the window exceeds POTS_MIN_RR_DECLINE_MS
+
+    A POTS recovery is identified by:
+      - Majority of consecutive RR pairs are increasing (HR decelerating)
+      - Total RR expansion over the window exceeds POTS_MIN_RR_RECOVERY_MS
+    """
+    diffs = np.diff(centroid)
+    frac_dec = float(np.mean(diffs < 0))
+    frac_inc = float(np.mean(diffs > 0))
+    total_decline = float(centroid[0] - centroid[-1])    # + = RR contracted
+    total_recovery = float(centroid[-1] - centroid[0])   # + = RR expanded
+
+    if (frac_dec > POTS_MIN_FRAC_DECREASING
+            and total_decline > POTS_MIN_RR_DECLINE_MS):
+        return "pots_ramp_up"
+
+    if (frac_inc > POTS_MIN_FRAC_INCREASING
+            and total_recovery > POTS_MIN_RR_RECOVERY_MS):
+        return "pots_recovery"
+
+    return ""   # no strong ramp pattern; caller applies HR-based label
 
 
 # ===================================================================== #
@@ -165,17 +208,18 @@ def discover_qrs_motifs(
     use_clean_only: bool = True,
     random_seed: int = 42,
 ) -> dict:
-    """Cluster 64-sample QRS windows to discover recurring morphologies.
+    """Cluster QRS windows to discover recurring morphologies.
 
     Parameters
     ----------
     peaks_df : pd.DataFrame
         Must have ``peak_id``.  Row order matches ``ecg_windows``.
     labels_df : pd.DataFrame
-        Must have ``peak_id``, ``label``, ``hard_filtered``,
-        ``phys_event_window``.
+        Must have ``peak_id``, ``label``, ``hard_filtered``.
+        ``phys_event_window`` is intentionally NOT used here — those
+        annotations mark PACs/PVCs/vagal events, not morphology clusters.
     ecg_windows : np.ndarray
-        Shape ``(n_beats, 64)``.
+        Shape ``(n_beats, QRS_WINDOW_SIZE)``.
     n_clusters : int
         Number of k-means clusters (default 12).
     use_clean_only : bool
@@ -190,19 +234,15 @@ def discover_qrs_motifs(
         ``centroids``, ``cluster_labels``, ``cluster_assignments``,
         ``kmeans_model``, ``inertia``, ``peak_ids``.
     """
-    # ── Align peaks and labels ───────────────────────────────────────
     merged = peaks_df[["peak_id"]].copy()
     merged["_row"] = np.arange(len(merged))
 
     label_cols = ["peak_id", "label", "hard_filtered"]
-    if "phys_event_window" in labels_df.columns:
-        label_cols.append("phys_event_window")
     if "rr_prev_ms" in labels_df.columns:
         label_cols.append("rr_prev_ms")
 
     merged = merged.merge(labels_df[label_cols], on="peak_id", how="left")
 
-    # ── Filter to clean beats ────────────────────────────────────────
     if use_clean_only:
         mask = (merged["label"] == "clean") & (~merged["hard_filtered"].fillna(False))
         selection = merged[mask].copy()
@@ -210,7 +250,7 @@ def discover_qrs_motifs(
         selection = merged.copy()
 
     if len(selection) == 0:
-        log.warning("No clean beats available for QRS motif discovery — using all beats")
+        log.warning("No clean beats for QRS motif discovery — using all beats")
         selection = merged.copy()
 
     row_indices = selection["_row"].values
@@ -219,50 +259,45 @@ def discover_qrs_motifs(
 
     log.info("QRS motif discovery: %d beats, %d clusters", len(selection), n_clusters)
 
-    # Adjust n_clusters if fewer beats than clusters
     actual_k = min(n_clusters, len(selection))
     if actual_k < n_clusters:
-        log.warning("Only %d beats available — reducing to %d clusters", len(selection), actual_k)
+        log.warning("Only %d beats — reducing to %d clusters", len(selection), actual_k)
 
-    # ── K-means ──────────────────────────────────────────────────────
     km = KMeans(n_clusters=actual_k, random_state=random_seed, n_init=10, max_iter=300)
     assignments = km.fit_predict(selected_windows)
-    centroids = km.cluster_centers_  # (k, 64)
+    centroids = km.cluster_centers_
 
-    # ── Auto-label clusters ──────────────────────────────────────────
     cluster_labels = []
     for ci in range(actual_k):
         cluster_mask = assignments == ci
         cluster_beats = selection[cluster_mask]
         cluster_windows = selected_windows[cluster_mask]
 
-        n_beats = int(cluster_mask.sum())
+        n_beats_ci = int(cluster_mask.sum())
         window_ptp = np.ptp(cluster_windows, axis=1)
-        mean_ptp = float(np.mean(window_ptp)) if n_beats > 0 else 0.0
-        std_ptp = float(np.std(window_ptp)) if n_beats > 0 else 0.0
+        mean_ptp = float(np.mean(window_ptp)) if n_beats_ci > 0 else 0.0
+        std_ptp = float(np.std(window_ptp)) if n_beats_ci > 0 else 0.0
 
-        # Compute mean HR from rr_prev_ms
         if "rr_prev_ms" in cluster_beats.columns:
             rr_vals = cluster_beats["rr_prev_ms"].dropna().values
-            mean_hr = 60000.0 / np.mean(rr_vals) if len(rr_vals) > 0 else 80.0
+            mean_hr = (
+                60000.0 / float(np.mean(rr_vals)) if len(rr_vals) > 0
+                else 60000.0 / RR_FALLBACK_MS
+            )
         else:
-            mean_hr = 80.0
+            mean_hr = 60000.0 / RR_FALLBACK_MS
 
-        # Check phys_event fraction
-        if "phys_event_window" in cluster_beats.columns:
-            phys_frac = float(cluster_beats["phys_event_window"].mean())
-        else:
-            phys_frac = 0.0
-
-        # ── Heuristic labeling ───────────────────────────────────────
-        if phys_frac > 0.3:
-            label = "pots_transition"
-        elif std_ptp > 0.3 * mean_ptp and mean_ptp > 0:
+        # Morphological quality check first — overrides HR-based labels.
+        # High inter-beat amplitude variance within a cluster indicates noise.
+        if std_ptp > 0.3 * mean_ptp and mean_ptp > 0:
             label = "noisy_cluster"
-        elif mean_hr < 75:
-            label = "normal_sinus_brady"
-        elif mean_hr > 100:
-            label = "sinus_tachycardia"
+        # Patient-specific HR-based labels.
+        # Note: HR > 130 BPM is common POTS physiology for this patient,
+        # not an artifact.  HR regularly reaches 186–190+ BPM (e.g. showers).
+        elif mean_hr < HR_BRADY_BPM:
+            label = "bradycardic"
+        elif mean_hr > HR_TACHY_BPM:
+            label = "tachycardic"
         else:
             label = "normal_sinus"
 
@@ -292,6 +327,10 @@ def discover_rr_motifs(
 ) -> dict:
     """Cluster sliding windows of consecutive RR intervals.
 
+    POTS transition windows are detected from RR dynamics alone —
+    progressive contraction ≥ 150 ms over the window with ≥ 65% of
+    consecutive pairs decreasing.
+
     Parameters
     ----------
     peaks_df : pd.DataFrame
@@ -311,24 +350,20 @@ def discover_rr_motifs(
         Same structure as ``discover_qrs_motifs``, with
         ``centroids`` shape ``(n_clusters, window_size)``.
     """
-    # ── Build RR series ──────────────────────────────────────────────
     merged = peaks_df[["peak_id"]].merge(
         labels_df[["peak_id", "rr_prev_ms"]], on="peak_id", how="left",
     )
     rr = merged["rr_prev_ms"].values.astype(np.float64)
     peak_ids_all = merged["peak_id"].values
 
-    # Fill NaN with median for sliding window computation
     rr_median = np.nanmedian(rr)
     if np.isnan(rr_median):
-        rr_median = 800.0  # fallback
+        rr_median = RR_FALLBACK_MS
     rr_filled = np.where(np.isnan(rr), rr_median, rr)
 
-    # ── Sliding windows ──────────────────────────────────────────────
     n = len(rr_filled)
     if n < window_size:
         log.warning("Only %d beats — cannot form RR windows of size %d", n, window_size)
-        # Return degenerate result
         km = KMeans(n_clusters=1, random_state=random_seed, n_init=1)
         single_window = rr_filled[:n]
         padded = np.zeros(window_size, dtype=np.float64)
@@ -345,29 +380,26 @@ def discover_rr_motifs(
 
     windows = []
     window_peak_ids = []
-
     for i in range(n - window_size + 1):
-        w = rr_filled[i : i + window_size]
-        windows.append(w)
-        # Associate with the center beat of the window
-        center_idx = i + window_size // 2
-        window_peak_ids.append(peak_ids_all[center_idx])
+        windows.append(rr_filled[i : i + window_size])
+        window_peak_ids.append(peak_ids_all[i + window_size // 2])
 
-    rr_windows = np.array(windows, dtype=np.float64)  # (n_windows, window_size)
+    rr_windows = np.array(windows, dtype=np.float64)
     window_peak_ids = np.array(window_peak_ids)
 
-    log.info("RR motif discovery: %d windows of size %d, %d clusters", len(rr_windows), window_size, n_clusters)
+    log.info(
+        "RR motif discovery: %d windows of size %d, %d clusters",
+        len(rr_windows), window_size, n_clusters,
+    )
 
     actual_k = min(n_clusters, len(rr_windows))
     if actual_k < n_clusters:
         log.warning("Only %d RR windows — reducing to %d clusters", len(rr_windows), actual_k)
 
-    # ── K-means ──────────────────────────────────────────────────────
     km = KMeans(n_clusters=actual_k, random_state=random_seed, n_init=10, max_iter=300)
     assignments = km.fit_predict(rr_windows)
-    centroids = km.cluster_centers_  # (k, window_size)
+    centroids = km.cluster_centers_
 
-    # ── Auto-label clusters ──────────────────────────────────────────
     cluster_labels = []
     for ci in range(actual_k):
         cluster_mask = assignments == ci
@@ -380,30 +412,32 @@ def discover_rr_motifs(
 
         mean_rr = float(np.mean(cluster_windows))
         std_rr = float(np.std(cluster_windows))
-        mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 80.0
-
-        # Check for ramp patterns (monotonically increasing/decreasing)
-        diffs = np.diff(centroids[ci])
-        frac_increasing = float(np.mean(diffs > 0))
-        frac_decreasing = float(np.mean(diffs < 0))
-
-        # ── Heuristic labeling ───────────────────────────────────────
+        mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 60000.0 / RR_FALLBACK_MS
         cv = std_rr / mean_rr if mean_rr > 0 else 0.0
 
-        if cv > 0.25:
-            label = "erratic_noisy"
-        elif frac_decreasing > 0.7 and mean_hr > 80:
-            label = "pots_ramp_up"  # RR decreasing → HR increasing
-        elif frac_increasing > 0.7 and mean_hr < 90:
-            label = "pots_recovery"  # RR increasing → HR decreasing
-        elif mean_hr < 65:
-            label = "bradycardic_rest"
-        elif mean_hr > 100:
-            label = "tachycardic"
-        else:
-            label = "stable_sinus"
+        centroid = centroids[ci]
 
-        cluster_labels.append(label)
+        # POTS ramp/recovery detection from RR dynamics.
+        ramp_label = _detect_rr_pattern(centroid)
+        if ramp_label:
+            cluster_labels.append(ramp_label)
+            continue
+
+        # High coefficient of variation → erratic/noisy RR pattern.
+        if cv > 0.25:
+            cluster_labels.append("erratic")
+            continue
+
+        # Patient-specific HR labels.
+        # HR regularly exceeds 130 BPM for this POTS patient (routinely ~186
+        # during showers, into the 190s otherwise) — "tachycardic" here means
+        # a high-HR cluster, not an implausible beat.
+        if mean_hr < HR_BRADY_BPM:
+            cluster_labels.append("bradycardic")
+        elif mean_hr > HR_TACHY_BPM:
+            cluster_labels.append("tachycardic")
+        else:
+            cluster_labels.append("stable_sinus")
 
     log.info("RR clusters: %s", dict(zip(range(actual_k), cluster_labels)))
 
@@ -436,7 +470,7 @@ def compute_motif_features(
     labels_df : pd.DataFrame
         Must have ``peak_id``, ``rr_prev_ms``.
     ecg_windows : np.ndarray
-        Shape ``(n_beats, 64)``.
+        Shape ``(n_beats, QRS_WINDOW_SIZE)``.
     qrs_motif_dict : dict
         Output of ``discover_qrs_motifs()``.
     rr_motif_dict : dict
@@ -445,54 +479,48 @@ def compute_motif_features(
     Returns
     -------
     pd.DataFrame
-        One row per beat with columns: peak_id,
-        dist_to_nearest_qrs_motif, nearest_qrs_motif_label,
-        nearest_qrs_motif_idx, dist_to_nearest_rr_motif,
-        nearest_rr_motif_label, nearest_rr_motif_idx,
-        qrs_anomaly_score, rr_anomaly_score,
-        is_qrs_anomaly, is_rr_anomaly.
+        One row per beat.  Columns: ``peak_id``,
+        ``dist_to_nearest_qrs_motif``, ``nearest_qrs_motif_label``,
+        ``nearest_qrs_motif_idx``, ``dist_to_nearest_rr_motif``,
+        ``nearest_rr_motif_label``, ``nearest_rr_motif_idx``,
+        ``qrs_anomaly_score``, ``rr_anomaly_score``,
+        ``is_qrs_anomaly``, ``is_rr_anomaly``.
     """
     n = len(peaks_df)
     peak_ids = peaks_df["peak_id"].values
 
     # ── QRS distances ────────────────────────────────────────────────
-    qrs_centroids = qrs_motif_dict["centroids"]  # (k, 64)
+    qrs_centroids = qrs_motif_dict["centroids"]
     qrs_labels = qrs_motif_dict["cluster_labels"]
 
-    # Compute distance from each beat window to each centroid
-    # Using broadcasting: (n, 1, 64) - (1, k, 64) → (n, k)
     qrs_dists = np.linalg.norm(
         ecg_windows[:, np.newaxis, :] - qrs_centroids[np.newaxis, :, :],
         axis=2,
-    )  # (n, k)
+    )
 
-    nearest_qrs_idx = qrs_dists.argmin(axis=1)  # (n,)
-    nearest_qrs_dist = qrs_dists[np.arange(n), nearest_qrs_idx]  # (n,)
+    nearest_qrs_idx = qrs_dists.argmin(axis=1)
+    nearest_qrs_dist = qrs_dists[np.arange(n), nearest_qrs_idx]
     nearest_qrs_label = [qrs_labels[int(i)] for i in nearest_qrs_idx]
 
     # ── RR distances ─────────────────────────────────────────────────
-    # Build RR windows for each beat (centered, zero-padded at edges)
     rr_window_size = rr_motif_dict["centroids"].shape[1]
-    rr_centroids = rr_motif_dict["centroids"]  # (k, window_size)
+    rr_centroids = rr_motif_dict["centroids"]
     rr_labels = rr_motif_dict["cluster_labels"]
 
-    # Get RR series
     merged = peaks_df[["peak_id"]].merge(
         labels_df[["peak_id", "rr_prev_ms"]], on="peak_id", how="left",
     )
     rr = merged["rr_prev_ms"].values.astype(np.float64)
     rr_median = np.nanmedian(rr)
     if np.isnan(rr_median):
-        rr_median = 800.0
+        rr_median = RR_FALLBACK_MS
     rr_filled = np.where(np.isnan(rr), rr_median, rr)
 
     half_w = rr_window_size // 2
-
     rr_windows = np.zeros((n, rr_window_size), dtype=np.float64)
     for i in range(n):
         start = i - half_w
         end = start + rr_window_size
-        # Clip to valid range and zero-pad
         src_start = max(0, start)
         src_end = min(n, end)
         dst_start = src_start - start
@@ -502,14 +530,13 @@ def compute_motif_features(
     rr_dists = np.linalg.norm(
         rr_windows[:, np.newaxis, :] - rr_centroids[np.newaxis, :, :],
         axis=2,
-    )  # (n, k)
+    )
 
     nearest_rr_idx = rr_dists.argmin(axis=1)
     nearest_rr_dist = rr_dists[np.arange(n), nearest_rr_idx]
     nearest_rr_label = [rr_labels[int(i)] for i in nearest_rr_idx]
 
     # ── Anomaly scores (normalized by mean clean-beat distance) ──────
-    # Use clean-beat mean distance as baseline
     clean_mask_df = peaks_df[["peak_id"]].merge(
         labels_df[["peak_id", "label"]], on="peak_id", how="left",
     )
@@ -522,15 +549,13 @@ def compute_motif_features(
         mean_qrs_dist_clean = float(np.mean(nearest_qrs_dist))
         mean_rr_dist_clean = float(np.mean(nearest_rr_dist))
 
-    # Avoid division by zero
     mean_qrs_dist_clean = max(mean_qrs_dist_clean, 1e-8)
     mean_rr_dist_clean = max(mean_rr_dist_clean, 1e-8)
 
     qrs_anomaly_score = (nearest_qrs_dist / mean_qrs_dist_clean).astype(np.float32)
     rr_anomaly_score = (nearest_rr_dist / mean_rr_dist_clean).astype(np.float32)
 
-    # ── Build output DataFrame ───────────────────────────────────────
-    result = pd.DataFrame({
+    return pd.DataFrame({
         "peak_id": peak_ids,
         "dist_to_nearest_qrs_motif": nearest_qrs_dist.astype(np.float32),
         "nearest_qrs_motif_label": nearest_qrs_label,
@@ -544,27 +569,12 @@ def compute_motif_features(
         "is_rr_anomaly": rr_anomaly_score > 2.0,
     })
 
-    return result
-
 
 # ===================================================================== #
 #  One-hot encoding helper                                              #
 # ===================================================================== #
 def get_motif_dummies(motif_features_df: pd.DataFrame) -> pd.DataFrame:
-    """One-hot encode the motif label columns.
-
-    Parameters
-    ----------
-    motif_features_df : pd.DataFrame
-        Must contain ``nearest_qrs_motif_label`` and
-        ``nearest_rr_motif_label``.
-
-    Returns
-    -------
-    pd.DataFrame
-        One-hot columns ready to concatenate with the beat feature matrix.
-        Column names: ``motif_qrs_{label}`` and ``motif_rr_{label}``.
-    """
+    """One-hot encode the motif label columns for use as model features."""
     dummies = pd.DataFrame(index=motif_features_df.index)
 
     if "nearest_qrs_motif_label" in motif_features_df.columns:
@@ -590,51 +600,15 @@ def save_motifs(
     rr_motif_dict: dict,
     output_dir: str,
 ) -> None:
-    """Save motif models to disk via joblib.
-
-    Parameters
-    ----------
-    qrs_motif_dict, rr_motif_dict : dict
-        Output of ``discover_qrs_motifs()`` and ``discover_rr_motifs()``.
-    output_dir : str
-        Directory to save into (created if needed).
-    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-
-    joblib.dump(
-        {"version": MOTIF_VERSION, **qrs_motif_dict},
-        out / "qrs_motifs.joblib",
-    )
-    joblib.dump(
-        {"version": MOTIF_VERSION, **rr_motif_dict},
-        out / "rr_motifs.joblib",
-    )
+    joblib.dump({"version": MOTIF_VERSION, **qrs_motif_dict}, out / "qrs_motifs.joblib")
+    joblib.dump({"version": MOTIF_VERSION, **rr_motif_dict}, out / "rr_motifs.joblib")
     log.info("Saved motif models → %s", out)
 
 
 def load_motifs(motif_dir: str) -> tuple[dict, dict]:
-    """Load motif models from disk.
-
-    Parameters
-    ----------
-    motif_dir : str
-        Directory containing ``qrs_motifs.joblib`` and ``rr_motifs.joblib``.
-
-    Returns
-    -------
-    tuple[dict, dict]
-        ``(qrs_motif_dict, rr_motif_dict)``.
-
-    Raises
-    ------
-    FileNotFoundError
-        If motif files don't exist.
-    ValueError
-        If version doesn't match.
-    """
     d = Path(motif_dir)
-
     qrs_path = d / "qrs_motifs.joblib"
     rr_path = d / "rr_motifs.joblib"
 
@@ -646,12 +620,11 @@ def load_motifs(motif_dir: str) -> tuple[dict, dict]:
     qrs = joblib.load(qrs_path)
     rr = joblib.load(rr_path)
 
-    # Version check
     for name, data in [("QRS", qrs), ("RR", rr)]:
         v = data.get("version", "?")
         if v != MOTIF_VERSION:
             log.warning(
-                "%s motif version mismatch: expected %s, got %s — results may differ",
+                "%s motif version mismatch: expected %s, got %s — re-run discover",
                 name, MOTIF_VERSION, v,
             )
 
@@ -669,20 +642,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ── discover ──────────────────────────────────────────────────────
     p_disc = sub.add_parser("discover", help="Discover QRS and RR motifs")
-    p_disc.add_argument("--beat-features", required=True, help="Path to beat_features.parquet")
-    p_disc.add_argument("--labels", required=True, help="Path to labels.parquet")
+    p_disc.add_argument("--beat-features", required=True)
+    p_disc.add_argument("--labels", required=True)
     p_disc.add_argument("--output", required=True, help="Output directory for motif models")
     p_disc.add_argument("--n-qrs-clusters", type=int, default=12)
     p_disc.add_argument("--n-rr-clusters", type=int, default=8)
 
-    # ── compute ───────────────────────────────────────────────────────
     p_comp = sub.add_parser("compute", help="Compute motif features for all beats")
     p_comp.add_argument("--beat-features", required=True)
     p_comp.add_argument("--labels", required=True)
-    p_comp.add_argument("--motifs", required=True, help="Motif model directory")
-    p_comp.add_argument("--output", required=True, help="Output motif_features.parquet")
+    p_comp.add_argument("--motifs", required=True)
+    p_comp.add_argument("--output", required=True)
 
     return parser
 
@@ -691,7 +662,6 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     if args.command == "discover":
-        # Load data
         bf_path = Path(args.beat_features)
         proc_dir = bf_path.parent
 
@@ -701,29 +671,24 @@ def main() -> None:
 
         log.info("Loaded: %d peaks, %d labels", len(peaks_df), len(labels_df))
 
-        # Extract ECG windows
-        ecg_windows = _load_ecg_windows(peaks_df, ecg_samples_path, window_size=64)
+        ecg_windows = _load_ecg_windows(peaks_df, ecg_samples_path)
         log.info("ECG windows shape: %s", ecg_windows.shape)
 
-        # ── Discover QRS motifs ──────────────────────────────────────
         qrs_motifs = discover_qrs_motifs(
             peaks_df, labels_df, ecg_windows,
             n_clusters=args.n_qrs_clusters,
         )
-
-        # ── Discover RR motifs ───────────────────────────────────────
         rr_motifs = discover_rr_motifs(
             peaks_df, labels_df,
             n_clusters=args.n_rr_clusters,
         )
 
-        # ── Save ─────────────────────────────────────────────────────
         save_motifs(qrs_motifs, rr_motifs, args.output)
 
-        # ── Print summary ────────────────────────────────────────────
         print(f"\n{'=' * 72}")
         print("  QRS Motif Discovery")
         print(f"{'=' * 72}")
+        print(f"  Window size: {QRS_WINDOW_SIZE} samples = {QRS_WINDOW_SIZE / SAMPLE_RATE * 1000:.0f} ms @ {SAMPLE_RATE} Hz")
         print(f"  Beats clustered: {len(qrs_motifs['cluster_assignments'])}")
         print(f"  Clusters: {len(qrs_motifs['cluster_labels'])}")
         print(f"  Inertia: {qrs_motifs['inertia']:.2f}")
@@ -754,7 +719,7 @@ def main() -> None:
             spark = _sparkline(centroid, width=20)
             mean_rr = float(np.mean(centroid))
             mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 0.0
-            print(f"  [{ci:2d}] {label:20s}  n={n_wins:5d}  HR≈{mean_hr:.0f}bpm  {spark}")
+            print(f"  [{ci:2d}] {label:20s}  n={n_wins:5d}  HR≈{mean_hr:.0f} BPM  {spark}")
 
         print(f"{'=' * 72}")
 
@@ -766,24 +731,19 @@ def main() -> None:
         labels_df = pd.read_parquet(args.labels)
         ecg_samples_path = str(proc_dir / "ecg_samples.parquet")
 
-        # Load ECG windows
-        ecg_windows = _load_ecg_windows(peaks_df, ecg_samples_path, window_size=64)
+        ecg_windows = _load_ecg_windows(peaks_df, ecg_samples_path)
 
-        # Load motifs
         qrs_motifs, rr_motifs = load_motifs(args.motifs)
 
-        # Compute features
         result = compute_motif_features(
             peaks_df, labels_df, ecg_windows, qrs_motifs, rr_motifs,
         )
 
-        # Save
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         result.to_parquet(out, index=False, compression="snappy")
         log.info("Saved motif features → %s", out)
 
-        # ── Summary ──────────────────────────────────────────────────
         n = len(result)
         print(f"\n{'=' * 72}")
         print("  Motif Feature Computation")
@@ -796,14 +756,17 @@ def main() -> None:
             print(f"\n  RR motif distribution:")
             for lbl, cnt in result["nearest_rr_motif_label"].value_counts().items():
                 print(f"    {lbl}: {cnt} ({100.0 * cnt / n:.1f}%)")
-            print(f"\n  QRS anomaly score: mean={result['qrs_anomaly_score'].mean():.4f}  "
-                  f"max={result['qrs_anomaly_score'].max():.4f}")
-            print(f"  RR anomaly score:  mean={result['rr_anomaly_score'].mean():.4f}  "
-                  f"max={result['rr_anomaly_score'].max():.4f}")
-            print(f"  QRS anomalies (>2σ): {result['is_qrs_anomaly'].sum()}")
-            print(f"  RR anomalies (>2σ):  {result['is_rr_anomaly'].sum()}")
+            print(
+                f"\n  QRS anomaly score: mean={result['qrs_anomaly_score'].mean():.4f}"
+                f"  max={result['qrs_anomaly_score'].max():.4f}"
+            )
+            print(
+                f"  RR anomaly score:  mean={result['rr_anomaly_score'].mean():.4f}"
+                f"  max={result['rr_anomaly_score'].max():.4f}"
+            )
+            print(f"  QRS anomalies (>2×): {result['is_qrs_anomaly'].sum()}")
+            print(f"  RR anomalies (>2×):  {result['is_rr_anomaly'].sum()}")
 
-            # One-hot preview
             dummies = get_motif_dummies(result)
             print(f"\n  One-hot columns ({len(dummies.columns)}): {list(dummies.columns)}")
 
