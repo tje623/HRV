@@ -1,0 +1,29 @@
+"""Forwarding stub — all constants now live in the parent config.py."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import (
+    # re-export everything the HRV scripts might import from here
+    COL_MAPPING, MAX_GAP, NEIGHBORING_BEATS, MAX_CONDITIONAL_GAP,
+    LOW_VAR_THRESHOLD, LOW_VAR_BEATS, MS_IN_SECOND, TIMEFRAMES, MIN_INT,
+    STATS, BM, BMS, TF, ENTROPIC_INTERVALS, DEC, DECX, NORM, ANALYSIS_TF,
+    MAX_INTERPOLATION, MIN_WEEKLY_HRS, MIN_DAILY_HRS, MIN_OVERALL_HRS,
+    CIR_METRICS, KEY_METRICS, NONLINEAR_METRICS, FREQ_METRICS,
+    CHNG_PT_PENALTY, CHNG_PT_COLORS, HRV3_PLOT_TYPES, HRV3_SHEET_NAMES,
+    MPL_RC_PARAMS, DT_CSVS_FORMAT, DT_CSVS_FILENAME, DT_XL_FORMAT,
+    DT_HR_FORMAT, DT_XL_FILENAME, HR_DEC, SEQUENT_SCRIPTS, VIZ_SUBDIRS,
+    VIZ_DIR, HR_CSV, XL_MET, XL_STAT, RAW_ECG_DIR, RR_CSV, XL_BASE,
+    MARKER_CSV, DEVICE_HR_CSV, DEVICE_RR_CSV, ECG_DIR,
+    INTERVALS_JSON, IHR_INTERVALS_JSON, HRV_LEDGER_JSON,
+    OUTPUTS_DIR, ENTROPIC_DIR, HRV_DIR_ACC,
+    SCRIPTS_DIR, CHECKPOINT_DIR,
+)
+
+# Legacy name aliases kept for any callers that still use the old names
+INTERVALS     = INTERVALS_JSON
+IHR_INTERVALS = IHR_INTERVALS_JSON
+HRV_LEDGER    = HRV_LEDGER_JSON
+HRV_DIR       = HRV_DIR_ACC
+SCRIPT_DIR    = SCRIPTS_DIR
+
+__all__ = [name for name in dir() if not name.startswith('_')]

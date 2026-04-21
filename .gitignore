@@ -1,50 +1,41 @@
-# Data files (large — never commit raw ECG or processed parquet)
-data/
-*.parquet
-*.csv
-*.json
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.Spotlight-V100/
+.fseventsd/
+.DocumentRevisions-V100/
+.TemporaryItems/
+.Trashes/
 
-# Trained model weights
-models/*.pt
-models/*.joblib
-models/backup_*/
-models/cnn_checkpoints/
-models/cnn2d_checkpoints/
-
-# Training logs and checkpoints
-lightning_logs/
-checkpoints/
-terminal_logs/
-retrain_pipeline.log
-*.log
-*.ckpt/
-
-# Annotation output (large / personal data)
-annotation_queues/
-annotations/
-motifs/
-memory/
-reannotation_presorted.csv
-
-# Raw ECG and peak data (on external SSD)
-new_peaks/
-new_processed/
-peaks/
-processed/
-raw_ecg/
-auto_categorization/
-
-# Python artifacts
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
 .Python
 *.egg-info/
-.eggs/
 dist/
 build/
-.env
-.venv
 
-# macOS
-.DS_Store
+# ── Large data directories (never commit) ────────────────────────────────────
+Data/
+Processed/
+Outputs/
+zArchive/
+
+# ── Model weights (large binaries, version separately if needed) ─────────────
+Artifact Detector/Models/
+Models/
+*.pt
+*.joblib
+*.pkl
+
+# ── Residual old directory ────────────────────────────────────────────────────
+Artifact Detector/
+
+# ── Scratch / generated files ────────────────────────────────────────────────
+Scripts/config_candidate.py
+Scripts/Archive
+Scripts/__pycache__/
+Scripts/.DS_Store
+*.log
+*.tmp

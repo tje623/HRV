@@ -1,0 +1,216 @@
+{
+  "artifacts": [
+    1738560614520,
+    ~~ 2289 more ~~,
+    1758928870930
+  ],
+  "validated_segments": [
+    "seg_0",
+    ~~ 1728 additional segments ~~,
+    "seg_999"
+  ],
+  "return_to_pile": [
+    {
+      "segment_idx": 2698,
+      "start_time": "2025-06-20T02:29:25.162000",
+      "end_time": "2025-06-20T02:30:25.162000",
+      "marked_at": "2025-11-03T03:44:54.353755"
+    },
+    {
+      ~~5 additional segments~~
+    },
+    {
+      "segment_idx": 4093,
+      "start_time": "2025-09-14T02:53:31.339000",
+      "end_time": "2025-09-14T02:54:31.339000",
+      "marked_at": "2025-11-14T08:57:13.949564"
+    }
+  ],
+  "last_segment_idx": 3449,
+  "last_order_pos": 129,
+  "last_modified": "2025-11-16T02:29:13.839578",
+  "segment_order": [
+    568,
+    ~~329 additional segments~~,
+    2724
+  ],
+  "order_mode": "spread",
+  "order_seed": null,
+  "segmentation_version": 2,
+  "statistics": {
+    "total_artifacts": 2203,
+    "flagged_for_interpolation": 330,
+    "bad_segments": 22,
+    "total_events": 63,
+    "validated_segments": 1732,
+    "return_pile_size": 7,
+    "partial_bad_regions": 4,
+    "segments_with_partial_bad": 2,
+    "validated_rr_intervals": 170920,
+    "granular": {
+      "artifacts": {
+        "total": 2203,
+        "unique_days": 159,
+        "max_per_segment": 34,
+        "segments_with_max": [
+          2790
+        ],
+        "average_per_month": 275.375,
+        "median_per_month": 231.0,
+        "counts_by_month": {
+          "2025-02": 145,
+          "2025-03": 378,
+          "2025-04": 105,
+          "2025-05": 68,
+          "2025-06": 609,
+          "2025-07": 436,
+          "2025-08": 278,
+          "2025-09": 184
+        },
+        "counts_by_day": {
+          "2025-02-03": 1,
+          ~~157 additional days~~,
+          "2025-09-26": 3
+        }
+      },
+      "interpolations": {
+        "total": 330,
+        "unique_days": 56,
+        "max_per_segment": 19,
+        "segments_with_max": [
+          933
+        ],
+        "average_per_month": 41.25,
+        "median_per_month": 31.0,
+        "counts_by_month": {
+          "2025-02": 22,
+          "2025-03": 68,
+          "2025-04": 11,
+          "2025-05": 1,
+          "2025-06": 116,
+          "2025-07": 50,
+          "2025-08": 37,
+          "2025-09": 25
+        },
+        "counts_by_day": {
+          "2025-02-07": 1,
+          ~~54 additional days~~,
+          "2025-09-22": 1
+        }
+      },
+      "events": {
+        "total": 63,
+        "unique_days": 23,
+        "max_per_segment": 10,
+        "segments_with_max": [
+          2149
+        ],
+        "average_per_month": 7.875,
+        "median_per_month": 7.0,
+        "counts_by_month": {
+          "2025-02": 13,
+          "2025-03": 1,
+          "2025-04": 6,
+          "2025-05": 14,
+          "2025-06": 2,
+          "2025-07": 6,
+          "2025-08": 13,
+          "2025-09": 8
+        },
+        "counts_by_day": {
+          "2025-02-02": 1,
+          ~~21 additional days~~,
+          "2025-09-21": 6
+        }
+      },
+      "added": {
+        "total": 2257,
+        "unique_days": 123,
+        "max_per_segment": 50,
+        "segments_with_max": [
+          2678
+        ],
+        "average_per_month": 282.125,
+        "median_per_month": 210.5,
+        "counts_by_month": {
+          "2025-02": 150,
+          "2025-03": 435,
+          "2025-04": 43,
+          "2025-05": 30,
+          "2025-06": 743,
+          "2025-07": 435,
+          "2025-08": 253,
+          "2025-09": 168
+        },
+        "counts_by_day": {
+          "2025-02-04": 3,
+          ~~121 additional days~~,
+          "2025-09-26": 1
+        }
+      }
+    }
+  },
+  "added_r_peaks": [
+    "2025-02-04T18:01:42.399369220",
+    ~~2311 additional added r-peak~~,
+    "2025-09-26T18:16:11.259622767"
+  ],
+  "tagged_physiological_events": [
+    1738477429017,
+    ~~61 additional physiological events~~,
+    1758427613602
+  ],
+  "bad_segments": [
+    766,
+    ~~20 additional bad segments~~,
+    3755
+  ],
+  "segment_timestamps": [
+    {
+      "segment_idx": 0,
+      "first_timestamp": "2025-02-02T06:23:13.282000",
+      "last_timestamp": "2025-02-02T06:24:13.276000"
+    },
+    {
+      ~~4331 additional segment timestamps~~,
+    },
+    {
+      "segment_idx": 4433,
+      "first_timestamp": "2025-09-27T05:11:50.081000",
+      "last_timestamp": "2025-09-27T05:12:50.073000"
+    }
+  ],
+  "flagged_for_interpolation": [
+    1738905040874,
+    ~~373 additional flagged for interpolation~~,
+    1758574448355
+  ],
+  "interpolated_replacements": [
+    {
+      "peak_id": 1738905040874,
+      "timestamp": "2025-02-07T05:10:41.093864430"
+    },
+    {
+      ~~1422 additional interpolated replacements~~,
+    },
+    {
+      "peak_id": 1758574448355,
+      "timestamp": "2025-09-22T21:03:25.361500"
+    }
+  ],
+  "bad_regions": [
+    {
+      "segment_idx": 568,
+      "start_time": "2025-02-26T05:10:24.912927423",
+      "end_time": "2025-02-26T05:10:51.351981729"
+    },
+    {
+      ~~2 additional bad regions~~,
+    },
+    {
+      "segment_idx": 1347,
+      "start_time": "2025-04-03T23:19:13.031745897",
+      "end_time": "2025-04-03T23:19:18.884182033"
+    }
+  ]
+}
