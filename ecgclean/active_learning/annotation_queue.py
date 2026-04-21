@@ -52,7 +52,7 @@ log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 VALID_LABELS = {"clean", "artifact", "interpolated", "phys_event", "missed_original"}
-SAMPLE_RATE_HZ = 130  # Polar H10 ECG sampling rate — do NOT change to 256
+SAMPLE_RATE_HZ = 125  # Polar H10 ECG sampling rate (empirically 8.000 ms/sample = 125 Hz)
 
 
 # ===================================================================== #

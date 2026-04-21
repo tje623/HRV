@@ -60,7 +60,7 @@ LABEL_TO_IDX = {lbl: i for i, lbl in enumerate(QUALITY_CLASSES)}
 IDX_TO_LABEL = {i: lbl for lbl, i in LABEL_TO_IDX.items()}
 IMAGE_SIZE = (64, 64)
 N_SCALES = 64
-MIN_SAMPLES = 260  # Minimum ECG samples for a meaningful scalogram (~2 s @ 130 Hz)
+MIN_SAMPLES = 250  # Minimum ECG samples for a meaningful scalogram (2 s @ 125 Hz)
 
 
 # ===================================================================== #
@@ -68,7 +68,7 @@ MIN_SAMPLES = 260  # Minimum ECG samples for a meaningful scalogram (~2 s @ 130 
 # ===================================================================== #
 def compute_scalogram(
     ecg_segment: np.ndarray,
-    sampling_rate: int = 130,
+    sampling_rate: int = 125,
     image_size: tuple[int, int] = IMAGE_SIZE,
 ) -> np.ndarray:
     """Compute a CWT Morlet scalogram from a raw ECG segment.
@@ -78,7 +78,7 @@ def compute_scalogram(
     ecg_segment : np.ndarray
         1-D array of ECG voltage samples for one segment.
     sampling_rate : int
-        Sample rate in Hz (default 130 for Polar H10 — do NOT use 256).
+        Sample rate in Hz (default 125 for Polar H10 — do NOT use 130 or 256).
     image_size : tuple[int, int]
         (height, width) of output image.
 
@@ -90,7 +90,7 @@ def compute_scalogram(
     """
     if len(ecg_segment) < MIN_SAMPLES:
         log.warning(
-            "Segment has only %d samples (< %d = ~2 s @ 130 Hz) — returning zero scalogram",
+            "Segment has only %d samples (< %d = 2 s @ 125 Hz) — returning zero scalogram",
             len(ecg_segment),
             MIN_SAMPLES,
         )

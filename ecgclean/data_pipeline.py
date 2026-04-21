@@ -64,15 +64,15 @@ ANNOTATION_MATCH_TOLERANCE_NS: int = 80 * MS_TO_NS  # 80 ms
 MIN_VALID_TIMESTAMP_NS: int = 1_577_836_800_000_000_000  # 2020-01-01 UTC in ns
 # Rows per chunk when streaming large ECG CSVs.  Keeps per-worker RAM usage
 # bounded to ~8 MB/chunk regardless of file size (some files are 2+ GB CSVs).
-_ECG_CHUNK_SIZE: int = 500_000
-ARTIFACT_FRACTION_BAD: float = 0.30               # >30% artifact → bad segment
+_ECG_CHUNK_SIZE: int = 10_000_000
+ARTIFACT_FRACTION_BAD: float = 0.50               # >30% artifact → bad segment
 MIN_VALIDATED_BEATS_CLEAN: int = 10               # minimum clean beats for "clean" segment
 
 # ECG polarity correction: if median amplitude at dominant peaks < this → inverted.
 # Applied per file in _process_one_ecg_file.
-_ECG_INVERSION_THRESHOLD: float = -0.05   # mV
+_ECG_INVERSION_THRESHOLD: float = -0.5   # mV
 _ECG_INVERSION_WINDOW_SEC: float = 1.0    # split into 1-second windows for detection
-_ECG_INVERSION_MIN_WINDOWS: int = 5       # need at least this many windows to decide
+_ECG_INVERSION_MIN_WINDOWS: int = 50       # need at least this many windows to decide
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1692,7 +1692,7 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(4, (os.cpu_count() or 4)),
+        default=8,
         help="Number of parallel workers for ECG file processing (default: min(4, cpu_count))",
     )
     parser.add_argument(

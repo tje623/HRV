@@ -3,14 +3,12 @@
 scripts/merge_features_for_training.py — Merge beat features with global
 template correlation for LightGBM retraining.
 
-Streams beat_features.parquet in batches (~80 MB each) to avoid loading
-the full dataset (54 M rows × 40+ cols ≈ 10-15 GB) into RAM at once.
+Streams beat_features.parquet in batches to avoid loading
+the full dataset into RAM at once.
 
 The global_template_features lookup (~700 MB) is loaded once into a
 pd.Series and used for vectorised per-batch reindex lookups.  Each
 enriched batch is written incrementally via pq.ParquetWriter.
-
-Peak memory: ~700 MB (lookup) + ~80 MB (one batch) + ~80 MB (output batch).
 
 Invariants enforced:
   • Output row count == input beat_features row count (streaming left join)
@@ -60,7 +58,7 @@ def merge_features(
     beat_features_path: Path,
     global_template_features_path: Path,
     output_path: Path,
-    batch_size: int = 500_000,
+    batch_size: int = 10_000_000,
 ) -> None:
     """Left-join beat features with global template correlation.
 
@@ -263,9 +261,9 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=500_000,
+        default=10_000_000,
         help=(
-            "Rows per streaming batch (default: 500 000 ≈ 80 MB/batch at "
+            "Rows per streaming batch (default: 5_000 000 ≈ 800 MB/batch at "
             "40 float32 columns).  Decrease if RAM is tight."
         ),
     )

@@ -70,7 +70,7 @@ _MIN_TEMPLATE_BEATS: int = 3
 
 # Pan-Tompkins finds the MWI peak (biased ~2-8 samples toward the QRS upslope)
 # not the R-peak apex. Snap the window center to argmax(|ecg|) within this radius.
-_PEAK_SNAP_SAMPLES: int = 8   # ±8 samples = ±62ms at 130 Hz
+_PEAK_SNAP_SAMPLES: int = 8   # ±8 samples = ±64ms at 125 Hz
 
 # Fork-shared globals dict for multiprocessing workers
 

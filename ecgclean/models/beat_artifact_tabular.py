@@ -1251,7 +1251,7 @@ def main() -> None:
     predict_parser.add_argument(
         "--batch-size",
         type=int,
-        default=500_000,
+        default=10_000_000,
         help=(
             "Rows per streaming batch (default: 500 000 ≈ 80 MB/batch). "
             "Decrease if RAM is tight."

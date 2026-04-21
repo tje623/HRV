@@ -44,7 +44,7 @@ def _get_device() -> torch.device:
 
 # Constants
 
-SAMPLE_RATE: int = 130  # Polar H10 ECG sampling rate — do NOT change to 256
+SAMPLE_RATE: int = 125  # Polar H10 ECG sampling rate (empirically 8.000 ms/sample = 125 Hz)
 WINDOW_SIZE: int = 256
 
 TABULAR_COLUMNS: list[str] = [
@@ -208,7 +208,7 @@ def _extract_windows(
                 gs["ecg"].values.astype(np.float32),
             )
 
-    sample_interval_ns = int(1e9 / SAMPLE_RATE)  # ~7 692 308 ns at 130 Hz
+    sample_interval_ns = int(1e9 / SAMPLE_RATE)  # 8 000 000 ns (exactly 8 ms at 125 Hz)
     half_window = WINDOW_SIZE // 2
 
     # Window extraction: vectorised per-segment (not per-beat)

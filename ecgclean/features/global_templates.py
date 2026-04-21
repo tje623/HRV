@@ -81,10 +81,10 @@ logger = logging.getLogger("ecgclean.features.global_templates")
 # Pan-Tompkins finds the MWI peak (biased ~2-8 samples toward the QRS upslope),
 # not the R-peak apex.  Snap the window center to argmax(|ecg|) within ±8
 # samples.  Must match beat_features.py exactly.
-_PEAK_SNAP_SAMPLES: int = 8   # ±8 samples = ±62ms at 130 Hz
+_PEAK_SNAP_SAMPLES: int = 8   # ±8 samples = ±64ms at 125 Hz
 
 _WINDOW_SIZE: int = 64
-_SAMPLE_RATE_HZ: int = 130    # Polar H10 — do NOT change to 256
+_SAMPLE_RATE_HZ: int = 125    # Polar H10 (empirically 8.000 ms/sample = 125 Hz) — do NOT use 130 or 256
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

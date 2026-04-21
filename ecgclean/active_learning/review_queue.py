@@ -62,7 +62,7 @@ import matplotlib.gridspec as gridspec
 
 # ─────────────────────────────────────────────────────────────────────────────
 VALID_LABELS = {"clean", "artifact", "interpolated", "phys_event", "missed_original"}
-SAMPLE_RATE_HZ = 130  # Polar H10 ECG sampling rate
+SAMPLE_RATE_HZ = 125  # Polar H10 ECG sampling rate (empirically 8.000 ms/sample = 125 Hz)
 
 # Label keys — pressing these sets a PENDING label (not saved until SPACE)
 LABEL_KEYMAP = {
