@@ -36,6 +36,7 @@ from config import SAMPLE_RATE_HZ, VAL_FRACTION, LGBM_RANDOM_STATE, CNN_MAX_EPOC
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pywt
 import pytorch_lightning as pl
 import torch
@@ -154,11 +155,13 @@ def _cache_key(segment_idx: int, ecg_samples_path: str | None) -> str:
 
 def _load_or_compute_scalogram(
     segment_idx: int,
-    ecg_samples_df: pd.DataFrame,
+    ecg_samples_path: str,
     cache_base: str | Path = "data/processed/scalogram_cache",
-    ecg_samples_path: str | None = None,
 ) -> np.ndarray:
-    """Load scalogram from cache or compute + cache it."""
+    """Load scalogram from cache or compute + cache it.
+
+    Uses parquet predicate pushdown — never loads the full ECG table.
+    """
     cache = _cache_dir(cache_base)
     key = _cache_key(segment_idx, ecg_samples_path)
     cache_file = cache / key
@@ -166,13 +169,19 @@ def _load_or_compute_scalogram(
     if cache_file.exists():
         return np.load(cache_file).astype(np.float32)
 
-    # Extract ECG samples for this segment
-    mask = ecg_samples_df["segment_idx"] == segment_idx
-    seg_ecg = ecg_samples_df.loc[mask].sort_values("timestamp_ms")["ecg"].values
+    # Load only this segment's ECG via predicate pushdown
+    table = pq.read_table(
+        ecg_samples_path,
+        filters=[("segment_idx", "==", segment_idx)],
+        columns=["timestamp_ms", "ecg"],
+    )
+    seg_ecg = (
+        table.to_pandas()
+        .sort_values("timestamp_ms")["ecg"]
+        .values.astype(np.float64)
+    )
 
     scalogram = compute_scalogram(seg_ecg)
-
-    # Save to cache
     np.save(cache_file, scalogram)
     return scalogram
 
@@ -185,27 +194,24 @@ class SegmentScalogramDataset(Dataset):
 
     Parameters
     ----------
-    ecg_samples_df : pd.DataFrame
-        ECG samples with ``timestamp_ms``, ``ecg``, ``segment_idx``.
+    ecg_samples_path : str
+        Path to ecg_samples.parquet. Loaded per-segment via predicate
+        pushdown — the full table is never held in memory.
     segments_df : pd.DataFrame
         Segment metadata with ``segment_idx``, ``quality_label``.
     training : bool
         If True, apply data augmentation (horizontal flip, brightness jitter).
-    ecg_samples_path : str | None
-        Path to ecg_samples.parquet for cache invalidation.
     """
 
     def __init__(
         self,
-        ecg_samples_df: pd.DataFrame,
+        ecg_samples_path: str,
         segments_df: pd.DataFrame,
         training: bool = False,
-        ecg_samples_path: str | None = None,
     ) -> None:
-        self.ecg_samples_df = ecg_samples_df
+        self.ecg_samples_path = ecg_samples_path
         self.segments_df = segments_df.reset_index(drop=True)
         self.training = training
-        self.ecg_samples_path = ecg_samples_path
 
         self.segment_indices = self.segments_df["segment_idx"].values
         self.labels = np.array([
@@ -227,8 +233,7 @@ class SegmentScalogramDataset(Dataset):
 
         scalogram = _load_or_compute_scalogram(
             seg_idx,
-            self.ecg_samples_df,
-            ecg_samples_path=self.ecg_samples_path,
+            self.ecg_samples_path,
         )
 
         # ── Augmentation (training only) ─────────────────────────────
@@ -387,10 +392,11 @@ def train(
     pl.seed_everything(LGBM_RANDOM_STATE)
 
     # ── Load data ────────────────────────────────────────────────────
-    ecg_samples = pd.read_parquet(ecg_samples_path)
+    # ECG samples are NOT loaded into memory — scalograms are computed
+    # per-segment via parquet predicate pushdown and cached to disk.
     segments = pd.read_parquet(segments_path)
 
-    log.info("Loaded: %d ECG samples, %d segments", len(ecg_samples), len(segments))
+    log.info("Loaded: %d segments (ECG samples streamed on demand)", len(segments))
 
     # Filter to segments that have quality_label
     if "quality_label" not in segments.columns:
@@ -430,12 +436,8 @@ def train(
     log.info("Class weights: %s", dict(zip(QUALITY_CLASSES, [f"{w:.2f}" for w in weights])))
 
     # ── Datasets ─────────────────────────────────────────────────────
-    train_ds = SegmentScalogramDataset(
-        ecg_samples, train_segs, training=True, ecg_samples_path=ecg_samples_path,
-    )
-    val_ds = SegmentScalogramDataset(
-        ecg_samples, val_segs, training=False, ecg_samples_path=ecg_samples_path,
-    )
+    train_ds = SegmentScalogramDataset(ecg_samples_path, train_segs, training=True)
+    val_ds = SegmentScalogramDataset(ecg_samples_path, val_segs, training=False)
 
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -580,7 +582,6 @@ def predict(
         Predictions with ``segment_idx``, ``quality_pred_cnn2d``,
         and per-class probabilities.
     """
-    ecg_samples = pd.read_parquet(ecg_samples_path)
     segments = pd.read_parquet(segments_path)
 
     # Load model
@@ -597,10 +598,8 @@ def predict(
         ckpt.get("trained_at", "?"), ckpt["n_classes"],
     )
 
-    # Dataset (no augmentation)
-    ds = SegmentScalogramDataset(
-        ecg_samples, segments, training=False, ecg_samples_path=ecg_samples_path,
-    )
+    # Dataset (no augmentation) — ECG streamed per-segment, not preloaded
+    ds = SegmentScalogramDataset(ecg_samples_path, segments, training=False)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # Predict
