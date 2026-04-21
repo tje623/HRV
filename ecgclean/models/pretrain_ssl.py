@@ -106,7 +106,7 @@ logging.basicConfig(
 )
 
 # ─── Constants ──────────────────────────────────────────────────────
-SAMPLE_RATE: int = 256
+SAMPLE_RATE: int = 130  # Polar H10 ECG sampling rate — do NOT change to 256
 WINDOW_SIZE: int = 256
 
 # Sparkline characters for ASCII waveform rendering
@@ -155,7 +155,7 @@ def _extract_windows(
                 gs["ecg"].values.astype(np.float32),
             )
 
-    sample_interval_ns = int(1e9 / SAMPLE_RATE)  # ~3 906 250 ns
+    sample_interval_ns = int(1e9 / SAMPLE_RATE)  # ~7 692 308 ns at 130 Hz
     half_window = WINDOW_SIZE // 2
 
     n_with_data = 0

@@ -1,47 +1,4 @@
 #!/usr/bin/env python3
-"""
-ecgclean/models/beat_artifact_cnn.py — Stage 2a: Hybrid CNN Beat Artifact Classifier
-
-A hybrid 1-D CNN + tabular model that classifies individual R-peaks as
-artifact (1) or clean (0).  The CNN branch processes a 256-sample raw ECG
-window (~1 second @ 256 Hz) and the tabular branch processes a 22-feature
-context vector extracted from the beat feature matrix.  Their embeddings are
-concatenated and passed through a two-layer fusion head.
-
-Framework: PyTorch Lightning.  Runs on CPU, MPS (Apple Silicon), and CUDA.
-
-Noise augmentation is the primary mechanism for addressing class imbalance
-(~1.3 % artifact).  During training, a random fraction of clean beats are
-corrupted with synthetic artifact patterns (baseline wander, electrode pop,
-EMG burst, lead-off transient, motion artifact, Gaussian noise) and added
-to the training set with label=1.  This teaches the model what artifacts
-*look like* without fabricating unrealistic feature-space interpolations.
-
-Training notes:
-    * Temporal split by segment_idx — all beats from earlier segments go
-      to train, later segments to val.  Never random.
-    * BCEWithLogitsLoss with pos_weight = n_clean / n_artifact.
-    * WeightedRandomSampler oversamples artifact beats 15x.
-    * EarlyStopping monitors val_pr_auc (mode=max, patience=15).
-    * Cosine annealing LR scheduler, T_max=50.
-    * PR-AUC on the artifact class is the primary metric.
-
-Usage:
-    # Train
-    python ecgclean/models/beat_artifact_cnn.py train \\
-        --beat-features data/processed/beat_features.parquet \\
-        --labels data/processed/labels.parquet \\
-        --ecg-samples data/processed/ecg_samples.parquet \\
-        --segment-quality-preds data/processed/segment_quality_preds.parquet \\
-        --output models/beat_cnn_v1.pt
-
-    # Predict
-    python ecgclean/models/beat_artifact_cnn.py predict \\
-        --beat-features data/processed/beat_features.parquet \\
-        --ecg-samples data/processed/ecg_samples.parquet \\
-        --model models/beat_cnn_v1.pt \\
-        --output data/processed/beat_cnn_preds.parquet
-"""
 
 from __future__ import annotations
 
@@ -85,33 +42,33 @@ def _get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# Constants
 
-SAMPLE_RATE: int = 256
+SAMPLE_RATE: int = 130  # Polar H10 ECG sampling rate — do NOT change to 256
 WINDOW_SIZE: int = 256
 
 TABULAR_COLUMNS: list[str] = [
-    # ── RR interval context (Feature Groups 1 + 2) ───────────────────────
+    # RR interval context
     "rr_prev", "rr_next", "rr_ratio", "rr_diff", "rr_mean",
     "rr_prev_2", "rr_next_2",
     "rr_local_mean_5", "rr_local_sd_5",
     "rr_abs_delta_prev", "rr_abs_delta_next", "rr_delta_ratio_next",
-    # ── QRS morphology + global template (Group 3) ────────────────────────
+    # QRS morphology + global template
     "qrs_corr_to_template", "qrs_corr_prev", "qrs_corr_next",
     "global_corr_clean",
-    # ── Raw ECG window statistics (Group 1 legacy) ────────────────────────
+    # Raw ECG window stats
     "window_mean", "window_std", "window_ptp", "window_min", "window_max",
-    # ── Label-free signal quality (Group 6) ──────────────────────────────
+    # Label-free signal quality
     "window_iqr", "window_kurtosis", "window_zcr",
     "r_peak_snr", "window_hf_noise_rms", "window_wander_slope",
     "window_energy_ratio",
-    # ── Physiological constraint flags (Group 4) ──────────────────────────
+    # Physiological constraint flags
     "physio_implausible",
     "pots_transition_candidate", "tachy_transition_candidate",
     "hr_suspicious_low", "hr_suspicious_high",
     "rr_suspicious_short", "rr_suspicious_long",
     "is_added_peak",
-    # ── Segment-level context (Group 5) ──────────────────────────────────
+    # Segment-level context
     "review_priority_score",
     "segment_artifact_fraction", "segment_rr_sd",
     "segment_clean_beat_count", "segment_quality_pred",
@@ -127,46 +84,26 @@ ARTIFACT_TYPES: list[str] = [
 ]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # NOISE AUGMENTATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def augment_clean_beat_to_artifact(
     window: np.ndarray,
     artifact_type: str | None = None,
 ) -> np.ndarray:
-    """Create a synthetic artifact from a clean ECG beat window.
-
-    Corrupts a clean 256-sample ECG window with one of six synthetic noise
-    patterns.  The augmented window should be labelled as artifact (1).
-
-    Each noise pattern's amplitude is scaled by ``window.std()`` so the
-    distortion is proportional to the signal's dynamic range.  If the
-    window is flat (std ≈ 0), a small fallback amplitude is used.
-
-    This function is **unit-testable**: it takes a numpy array and returns
-    a numpy array of the same shape.
-
-    Args:
-        window: 1-D float32 array of shape ``(256,)``.
-        artifact_type: One of ``ARTIFACT_TYPES``.  If ``None``, one is
-            chosen at random with equal probability.
-
-    Returns:
-        Corrupted window (same shape, float32).  The original is not
-        modified — a copy is made internally.
-    """
+    
     window = window.copy().astype(np.float32)
     n = len(window)
     sig_std = float(window.std())
     if sig_std < 1e-10:
-        sig_std = 1e-3  # fallback for flat windows
+        sig_std = 1e-3
 
     if artifact_type is None:
         artifact_type = random.choice(ARTIFACT_TYPES)
 
-    t = np.arange(n, dtype=np.float64) / SAMPLE_RATE  # seconds
+    t = np.arange(n, dtype=np.float64) / SAMPLE_RATE
 
     if artifact_type == "baseline_wander":
         amp = np.random.uniform(0.3, 1.5) * sig_std
@@ -200,14 +137,11 @@ def augment_clean_beat_to_artifact(
         block_end = min(start + block_len, n)
         ramp_end = min(block_end + ramp_len, n)
 
-        # Save recovery target before zeroing
         ramp_target = float(window[min(ramp_end, n - 1)])
 
-        # Set block to near-zero
         scale = np.random.uniform(0.0, 0.05)
         window[start:block_end] *= scale
 
-        # Recovery ramp back to original amplitude
         actual_ramp = ramp_end - block_end
         if actual_ramp > 0:
             ramp_start_val = float(window[max(block_end - 1, 0)])
@@ -233,21 +167,6 @@ def augment_clean_beat_to_artifact(
 
 
 def augment_clean_beat_preserve_label(window: np.ndarray) -> np.ndarray:
-    """Apply mild augmentation to a clean beat, preserving its label.
-
-    One of three mild augmentations is applied at random:
-    * Small Gaussian noise (sigma = 0.05 × std)
-    * Random amplitude scaling (Uniform 0.9–1.1)
-    * Small time-shift (roll by −2 to +2 samples)
-
-    The label stays 0 (clean).
-
-    Args:
-        window: 1-D float32 array of shape ``(256,)``.
-
-    Returns:
-        Augmented window (same shape, float32).
-    """
     window = window.copy().astype(np.float32)
     sig_std = float(window.std())
     n = len(window)
@@ -266,10 +185,9 @@ def augment_clean_beat_preserve_label(window: np.ndarray) -> np.ndarray:
 
     return window
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # SIGNAL PROCESSING UTILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def _extract_windows(
@@ -277,29 +195,10 @@ def _extract_windows(
     peak_segment_ids: np.ndarray,
     ecg_samples_df: pd.DataFrame,
 ) -> np.ndarray:
-    """Extract and bandpass-filter 256-sample ECG windows for all peaks.
-
-    For each peak, a 1-second window centred on the R-peak timestamp is
-    constructed by linear interpolation of the raw ECG samples at 256 Hz.
-    If no ECG data is available for a peak's segment, the window is
-    all-zeros (zero-padded).
-
-    After extraction, a 4th-order Butterworth bandpass filter (3–40 Hz)
-    is applied to each window.
-
-    Args:
-        peak_timestamps_ns: Timestamp of each peak in nanoseconds.
-        peak_segment_ids: Segment index for each peak.
-        ecg_samples_df: Raw ECG samples with columns
-            ``timestamp_ns``, ``ecg``, ``segment_idx``.
-
-    Returns:
-        Array of shape ``(n_beats, 256)`` with filtered windows (float32).
-    """
+    
     n_beats = len(peak_timestamps_ns)
     windows = np.zeros((n_beats, WINDOW_SIZE), dtype=np.float32)
 
-    # Group ECG samples by segment for fast lookup
     ecg_by_seg: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     if len(ecg_samples_df) > 0:
         for seg_idx, group in ecg_samples_df.groupby("segment_idx"):
@@ -309,10 +208,10 @@ def _extract_windows(
                 gs["ecg"].values.astype(np.float32),
             )
 
-    sample_interval_ns = int(1e9 / SAMPLE_RATE)  # ~3 906 250 ns
+    sample_interval_ns = int(1e9 / SAMPLE_RATE)  # ~7 692 308 ns at 130 Hz
     half_window = WINDOW_SIZE // 2
 
-    # ── Window extraction: vectorised per-segment (not per-beat) ─────────
+    # Window extraction: vectorised per-segment (not per-beat)
     # Outer loop is over unique segments (~few thousand per chunk), not over
     # individual beats (~millions).  All beats in a segment are interpolated
     # in a single np.interp call on the flattened (k×256,) target array.
@@ -344,9 +243,6 @@ def _extract_windows(
         "Window extraction: %d / %d beats have ECG data", n_with_data, n_beats
     )
 
-    # ── Bandpass filter: vectorised in batches of 10 K windows ───────────
-    # sosfiltfilt(sos, X, axis=1) filters all rows of X simultaneously —
-    # ~100× faster than one call per beat.
     sos = butter(4, [3.0, 40.0], btype="bandpass", fs=SAMPLE_RATE, output="sos")
     _FILTER_BATCH = 10_000
     nonzero_idx = np.where(np.any(windows != 0, axis=1))[0]
@@ -358,7 +254,7 @@ def _extract_windows(
             valid = ~np.any(np.isnan(filtered), axis=1)
             windows[idx[valid]] = filtered[valid]
         except ValueError:
-            pass  # keep unfiltered on edge cases
+            pass
 
     logger.info(
         "Bandpass filtered: %d / %d windows",
@@ -368,30 +264,14 @@ def _extract_windows(
     return windows
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # DATASET
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 class BeatDataset(Dataset):
-    """PyTorch Dataset for hybrid CNN + tabular beat classification.
-
-    Pre-extracts and bandpass-filters all 256-sample ECG windows during
-    ``__init__`` for efficiency.  During training, clean beats may be
-    stochastically augmented into synthetic artifacts.
-
-    Args:
-        peak_ids: 1-D array of peak identifiers.
-        peak_timestamps_ns: Timestamps (int64 ns) for each peak.
-        peak_segment_ids: Segment index for each peak.
-        tabular_features: 2-D array ``(n_beats, n_tabular)`` of tabular
-            features for the model's tabular branch.
-        ecg_samples_df: Raw ECG samples DataFrame.
-        labels: Binary labels (0 or 1).  ``None`` for inference.
-        training: Enable stochastic augmentation.
-        augment_fraction: Fraction of clean beats to corrupt into
-            synthetic artifacts per epoch (default 0.10).
-    """
+    """Pre-extracts and bandpass-filters all 256-sample ECG windows during
+    ``__init__`` for efficiency."""
 
     def __init__(
         self,
@@ -416,7 +296,6 @@ class BeatDataset(Dataset):
         self.training = training
         self.augment_fraction = augment_fraction
 
-        # Pre-extract and filter all windows
         self.windows = _extract_windows(
             peak_timestamps_ns, peak_segment_ids, ecg_samples_df
         )
@@ -436,27 +315,21 @@ class BeatDataset(Dataset):
         label = float(self.labels[idx])
         tabular = self.tabular[idx].copy()
 
-        # ── Augmentation (training only) ──────────────────────────────
         if self.training and label == 0.0:
             if random.random() < self.augment_fraction:
-                # Corrupt clean beat → synthetic artifact
                 window = augment_clean_beat_to_artifact(window)
                 label = 1.0
             elif random.random() < 0.20:
-                # Mild augmentation, label stays clean
                 window = augment_clean_beat_preserve_label(window)
 
-        # ── Per-beat normalisation ────────────────────────────────────
         mu = float(window.mean())
         sigma = float(window.std()) + 1e-8
         window = (window - mu) / sigma
 
-        # ── Convert to tensors ────────────────────────────────────────
         window_t = torch.from_numpy(window).float().unsqueeze(0)  # [1, 256]
         tabular_t = torch.from_numpy(tabular).float()
         label_t = torch.tensor(label, dtype=torch.float32)
 
-        # ── NaN assertion ─────────────────────────────────────────────
         assert not torch.isnan(window_t).any(), (
             f"NaN in window tensor for peak_id={self.peak_ids[idx]}, idx={idx}"
         )
@@ -467,28 +340,12 @@ class BeatDataset(Dataset):
         return window_t, tabular_t, label_t
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # LIGHTNING MODULE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 class BeatArtifactCNN(pl.LightningModule):
-    """Hybrid 1-D CNN + tabular model for beat-level artifact detection.
-
-    Architecture:
-        CNN branch:  Conv1d layers → AdaptiveAvgPool → 128-dim embedding
-        Tab branch:  Two linear layers → 32-dim embedding
-        Fusion:      Concat(128+32) → Linear → ReLU → Dropout → Linear → logit
-
-    The forward pass returns raw logits (no sigmoid).  Sigmoid is applied
-    in the loss function (``BCEWithLogitsLoss``) and explicitly during
-    inference and metric computation.
-
-    Args:
-        n_tabular_features: Number of tabular input features.
-        pos_weight: Positive-class weight for BCEWithLogitsLoss.
-        learning_rate: Adam learning rate (default 1e-3).
-    """
 
     def __init__(
         self,
@@ -500,7 +357,7 @@ class BeatArtifactCNN(pl.LightningModule):
         self.save_hyperparameters()
         self.learning_rate = learning_rate
 
-        # ── CNN branch: [B, 1, 256] → [B, 128] ──────────────────────
+        # CNN branch: [B, 1, 256] → [B, 128]
         self.cnn = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.BatchNorm1d(32),
@@ -520,7 +377,7 @@ class BeatArtifactCNN(pl.LightningModule):
             nn.Flatten(),
         )
 
-        # ── Tabular branch: [B, N_tab] → [B, 32] ────────────────────
+        # Tabular branch: [B, N_tab] → [B, 32]
         self.tab = nn.Sequential(
             nn.Linear(n_tabular_features, 64),
             nn.ReLU(),
@@ -528,7 +385,7 @@ class BeatArtifactCNN(pl.LightningModule):
             nn.ReLU(),
         )
 
-        # ── Fusion head: [B, 160] → [B, 1] ──────────────────────────
+        # Fusion head: [B, 160] → [B, 1]
         self.head = nn.Sequential(
             nn.Linear(160, 64),
             nn.ReLU(),
@@ -536,27 +393,17 @@ class BeatArtifactCNN(pl.LightningModule):
             nn.Linear(64, 1),
         )
 
-        # ── Loss ─────────────────────────────────────────────────────
         self.loss_fn = nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor([pos_weight])
         )
 
-        # ── Validation metric accumulators ────────────────────────────
         self.val_preds: list[torch.Tensor] = []
         self.val_labels: list[torch.Tensor] = []
 
     def forward(
         self, window: torch.Tensor, tabular: torch.Tensor
     ) -> torch.Tensor:
-        """Forward pass — returns raw logits (apply sigmoid externally).
 
-        Args:
-            window: ECG window tensor ``[B, 1, 256]``.
-            tabular: Tabular feature tensor ``[B, N_tab]``.
-
-        Returns:
-            Logit tensor ``[B, 1]``.
-        """
         cnn_out = self.cnn(window)  # [B, 128]
         tab_out = self.tab(tabular)  # [B, 32]
         fused = torch.cat([cnn_out, tab_out], dim=1)  # [B, 160]
@@ -621,28 +468,16 @@ class BeatArtifactCNN(pl.LightningModule):
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # EVALUATION HELPER
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def _evaluate_model(
     model: BeatArtifactCNN,
     val_loader: DataLoader,
 ) -> dict[str, Any]:
-    """Run final evaluation on the validation set.
 
-    Moves the model to CPU, iterates through *val_loader*, and computes
-    PR-AUC, F1, and basic statistics.
-
-    Args:
-        model: Trained Lightning module.
-        val_loader: Validation DataLoader.
-
-    Returns:
-        Dict with keys ``pr_auc``, ``f1_artifact``, ``n_val``,
-        ``n_artifact``, ``mean_p_artifact``.
-    """
     device = _get_device()
     model = model.to(device)
     model.eval()
@@ -681,9 +516,9 @@ def _evaluate_model(
     return metrics
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # TRAINING
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def train(
@@ -699,34 +534,9 @@ def train(
     random_seed: int = 42,
     num_workers: int = 4,
 ) -> dict:
-    """Train the hybrid CNN + tabular beat artifact classifier.
-
-    Loads all required data, builds ``BeatDataset``s for train and val
-    (temporal split by segment_idx), creates a ``BeatArtifactCNN``
-    Lightning module, and trains with early stopping on ``val_pr_auc``.
-
-    The best checkpoint is reloaded for final evaluation and saved as
-    a lightweight ``torch.save`` artifact.
-
-    Args:
-        beat_features_path: Path to ``beat_features.parquet``.
-        labels_path: Path to ``labels.parquet``.
-        ecg_samples_path: Path to ``ecg_samples.parquet``.
-        segment_quality_preds_path: Path to
-            ``segment_quality_preds.parquet``.
-        output_model_path: Destination for the model artifact (``.pt``).
-        val_fraction: Fraction of segments for validation.
-        max_epochs: Maximum training epochs.
-        batch_size: Training and validation batch size.
-        augment_fraction: Fraction of clean beats to corrupt per epoch.
-        random_seed: Global random seed.
-
-    Returns:
-        Dict of final validation metrics.
-    """
+    
     pl.seed_everything(random_seed)
 
-    # ── Load data ─────────────────────────────────────────────────────────
     bf_path = Path(beat_features_path)
     lb_path = Path(labels_path)
     ecg_path = Path(ecg_samples_path)
@@ -764,18 +574,15 @@ def train(
         len(peaks_df),
     )
 
-    # ── Prepare features ──────────────────────────────────────────────────
     if features_df.index.name == "peak_id":
         features_df = features_df.reset_index()
 
-    # Select available tabular columns
     tabular_cols = [c for c in TABULAR_COLUMNS if c in features_df.columns]
     if len(tabular_cols) < len(TABULAR_COLUMNS):
         missing = set(TABULAR_COLUMNS) - set(tabular_cols)
         logger.warning("Missing tabular columns (will be zero): %s", missing)
     logger.info("Tabular columns (%d): %s", len(tabular_cols), tabular_cols)
 
-    # ── Merge ─────────────────────────────────────────────────────────────
     label_cols_cnn = ["peak_id", "label"]
     for _col in ("reviewed", "in_bad_region"):
         if _col in labels_df.columns:
@@ -807,7 +614,6 @@ def train(
         logger.error("No beats matched across input files.")
         sys.exit(1)
 
-    # Binary label
     merged["target"] = (merged["label"] == "artifact").astype(int)
 
     n_artifact_total = int(merged["target"].sum())
@@ -820,7 +626,6 @@ def train(
         100.0 * n_artifact_total / max(len(merged), 1),
     )
 
-    # ── Exclude bad segments ──────────────────────────────────────────────
     bad_mask = merged["quality_label"] == "bad"
     if bad_mask.any():
         n_bad = int(bad_mask.sum())
@@ -831,7 +636,6 @@ def train(
         )
         merged = merged[~bad_mask].copy()
 
-    # ── Exclude beats inside bad_region windows ───────────────────────────
     if "in_bad_region" in merged.columns:
         n_before = len(merged)
         merged = merged[~merged["in_bad_region"]].copy()
@@ -839,16 +643,11 @@ def train(
         if n_excl > 0:
             logger.info("Excluded %d beats inside bad_regions", n_excl)
 
-    # ── Exclude interpolated beats ────────────────────────────────────────
     n_interp = int((merged["label"] == "interpolated").sum())
     if n_interp > 0:
         merged = merged[merged["label"] != "interpolated"].copy()
         logger.info("Excluded %d interpolated beats from training", n_interp)
 
-    # ── Restrict to reviewed beats only ───────────────────────────────────
-    # Unreviewed beats carry a default "clean" label that was never actually
-    # verified — training on them injects corrupted negatives and tanks
-    # PR-AUC.  Same policy as beat_artifact_tabular.py.
     if "reviewed" in merged.columns:
         n_before = len(merged)
         merged = merged[merged["reviewed"].astype(bool)].copy()
@@ -866,7 +665,6 @@ def train(
             "Re-run data_pipeline.py to add reviewed labels."
         )
 
-    # ── Temporal split by segment_idx ─────────────────────────────────────
     unique_segments = sorted(merged["segment_idx"].unique())
     n_segments = len(unique_segments)
     n_train_seg = max(1, int(n_segments * (1 - val_fraction)))
@@ -877,7 +675,6 @@ def train(
     train_df = merged[merged["segment_idx"].isin(train_segments)].copy()
     val_df = merged[merged["segment_idx"].isin(val_segments)].copy()
 
-    # Assert temporal integrity
     if len(train_df) > 0 and len(val_df) > 0:
         assert max(train_segments) < min(val_segments), (
             f"Temporal split violated: max train seg ({max(train_segments)}) "
@@ -893,7 +690,6 @@ def train(
         len(val_df),
     )
 
-    # ── Class imbalance ───────────────────────────────────────────────────
     n_train_pos = int(train_df["target"].sum())
     n_train_neg = len(train_df) - n_train_pos
     pos_weight = float(n_train_neg) / max(n_train_pos, 1)
@@ -911,7 +707,6 @@ def train(
         pos_weight,
     )
 
-    # ── Build datasets ────────────────────────────────────────────────────
     n_tabular = len(tabular_cols)
 
     train_dataset = BeatDataset(
@@ -939,7 +734,6 @@ def train(
         else None
     )
 
-    # ── WeightedRandomSampler: oversample artifacts 15× (vectorised) ─────
     artifact_mask = torch.from_numpy(train_dataset.labels == 1.0)
     sample_weights = torch.ones(len(train_dataset))
     sample_weights[artifact_mask] = 15.0
@@ -971,7 +765,6 @@ def train(
         else None
     )
 
-    # ── Model ─────────────────────────────────────────────────────────────
     model = BeatArtifactCNN(
         n_tabular_features=n_tabular,
         pos_weight=pos_weight,
@@ -982,12 +775,9 @@ def train(
         sum(p.numel() for p in model.parameters()),
     )
 
-    # ── Callbacks ─────────────────────────────────────────────────────────
     callbacks: list[pl.Callback] = []
 
     ckpt_dir = Path(output_model_path).parent / "cnn_checkpoints"
-    # Always start fresh — stale checkpoints from prior runs cause Lightning
-    # to warn and can load wrong weights if the model architecture changed.
     if ckpt_dir.exists():
         shutil.rmtree(ckpt_dir)
         logger.info("Removed stale checkpoint directory: %s", ckpt_dir)
@@ -1010,7 +800,6 @@ def train(
         )
         callbacks.append(early_stop_cb)
 
-    # ── Trainer ───────────────────────────────────────────────────────────
     trainer = pl.Trainer(
         accelerator="auto",
         max_epochs=max_epochs,
@@ -1029,7 +818,6 @@ def train(
 
     trainer.fit(model, train_loader, val_loader)
 
-    # ── Load best checkpoint ──────────────────────────────────────────────
     best_path = checkpoint_cb.best_model_path
     if best_path:
         logger.info("Loading best checkpoint: %s", best_path)
@@ -1038,7 +826,6 @@ def train(
     else:
         logger.info("No checkpoint saved — using last model state")
 
-    # ── Final evaluation ──────────────────────────────────────────────────
     final_metrics: dict[str, Any] = {}
     if val_loader is not None:
         final_metrics = _evaluate_model(model, val_loader)
@@ -1046,7 +833,6 @@ def train(
     else:
         logger.warning("No validation set — skipping final evaluation")
 
-    # ── Save model artifact ───────────────────────────────────────────────
     trained_at = datetime.now(timezone.utc).isoformat()
 
     artifact: dict[str, Any] = {
@@ -1063,7 +849,6 @@ def train(
     torch.save(artifact, out_path)
     logger.info("Saved model artifact → %s", out_path)
 
-    # ── Print summary ─────────────────────────────────────────────────────
     _print_training_summary(
         n_total=len(merged),
         n_train=len(train_df),
@@ -1122,9 +907,9 @@ def _print_training_summary(
     print(f"{'=' * 72}\n")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # INFERENCE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def predict(
@@ -1134,23 +919,7 @@ def predict(
     model_path: str,
     batch_size: int = 1024,
 ) -> pd.DataFrame:
-    """Run inference using a trained CNN artifact classifier.
-
-    Loads the model artifact, constructs ``BeatDataset`` (no augmentation),
-    and returns per-beat artifact probabilities.
-
-    Args:
-        beat_features: Beat feature DataFrame indexed by ``peak_id``.
-        ecg_samples_df: Raw ECG samples DataFrame.
-        peaks_df: Peaks DataFrame with ``peak_id``, ``timestamp_ns``,
-            ``segment_idx`` columns.
-        model_path: Path to the ``.pt`` model artifact.
-        batch_size: Inference batch size.
-
-    Returns:
-        DataFrame with columns ``peak_id`` (int64) and
-        ``p_artifact_cnn`` (float32).
-    """
+    
     mpath = Path(model_path)
     if not mpath.exists():
         raise FileNotFoundError(f"Model not found: {mpath}")
@@ -1169,7 +938,6 @@ def predict(
         device,
     )
 
-    # ── Reconstruct model ─────────────────────────────────────────────────
     model = BeatArtifactCNN(
         n_tabular_features=n_tabular,
         pos_weight=artifact.get("pos_weight", 1.0),
@@ -1178,19 +946,16 @@ def predict(
     model.eval()
     model.to(device)
 
-    # ── Prepare data ──────────────────────────────────────────────────────
     df = beat_features.copy()
     if df.index.name == "peak_id":
         df = df.reset_index()
 
-    # Join peaks for timestamps and segment_ids
     df = df.merge(
         peaks_df[["peak_id", "timestamp_ns", "segment_idx"]].drop_duplicates(),
         on="peak_id",
         how="inner",
     )
 
-    # Handle missing tabular columns
     for col in tabular_cols:
         if col not in df.columns:
             df[col] = 0.0
@@ -1212,7 +977,6 @@ def predict(
         num_workers=0,
     )
 
-    # ── Inference ─────────────────────────────────────────────────────────
     all_probas: list[np.ndarray] = []
 
     with torch.no_grad():
@@ -1246,9 +1010,9 @@ def predict(
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 # CLI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════
 
 
 def _cli_train(args: argparse.Namespace) -> None:
@@ -1285,7 +1049,6 @@ def _cli_predict(args: argparse.Namespace) -> None:
         logger.error("peaks.parquet not found at %s", peaks_path)
         sys.exit(1)
 
-    # ── Load model ────────────────────────────────────────────────────────
     mpath = Path(args.model)
     if not mpath.exists():
         logger.error("Model not found: %s", mpath)
@@ -1309,9 +1072,8 @@ def _cli_predict(args: argparse.Namespace) -> None:
         trained_at, n_tabular, device,
     )
 
-    # ── Load only the columns we actually need ────────────────────────────
-    # beat_features_merged has 40+ columns; the CNN only uses 22 tabular cols.
-    # Loading all columns would waste ~5 GB unnecessarily.
+    # Load only the columns the saved model was trained on (up to 41 tabular cols).
+    # Full beat_features parquet is ~5 GB — only read needed columns.
     # ecg_samples.parquet is NOT loaded here — it is streamed per chunk below.
     bf_schema_names = set(pq.read_schema(bf_path).names)
     needed_bf_cols = [
@@ -1320,7 +1082,6 @@ def _cli_predict(args: argparse.Namespace) -> None:
     ]
     beat_features = pq.read_table(bf_path, columns=needed_bf_cols).to_pandas()
 
-    # Only the three columns needed to join and drive the segment chunking
     peaks_df = pq.read_table(
         peaks_path,
         columns=["peak_id", "timestamp_ns", "segment_idx"],
@@ -1386,7 +1147,6 @@ def _cli_predict(args: argparse.Namespace) -> None:
                 chunk_num, n_chunks, seg_min, seg_max, len(chunk_df),
             )
 
-            # Load ECG samples for this segment range only
             ecg_chunk = pq.read_table(
                 ecg_path,
                 filters=[
@@ -1408,13 +1168,11 @@ def _cli_predict(args: argparse.Namespace) -> None:
                 chunk_df[tabular_cols].values.astype(np.float32), nan=0.0
             )
 
-            # Inference in mini-batches
             chunk_probas: list[float] = []
             for b in range(0, len(chunk_df), batch_size):
                 win_b = windows[b : b + batch_size].copy()  # (B, 256)
                 tab_b = tabular[b : b + batch_size]
 
-                # Per-beat normalisation (mirrors BeatDataset.__getitem__)
                 mu = win_b.mean(axis=-1, keepdims=True)
                 sigma = win_b.std(axis=-1, keepdims=True) + 1e-8
                 win_b = (win_b - mu) / sigma
@@ -1449,7 +1207,6 @@ def _cli_predict(args: argparse.Namespace) -> None:
 
     logger.info("Saved predictions → %s", out_path)
 
-    # Print summary
     pct = 100.0 * total_predicted_artifact / max(total_beats, 1)
     print(f"\n{'=' * 72}")
     print("  CNN Beat Artifact Predictions")
@@ -1472,7 +1229,6 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # ── train ─────────────────────────────────────────────────────────────
     tp = subparsers.add_parser(
         "train", help="Train the hybrid CNN artifact classifier"
     )
@@ -1525,7 +1281,7 @@ def main() -> None:
         ),
     )
 
-    # ── predict ───────────────────────────────────────────────────────────
+    # predict
     pp = subparsers.add_parser(
         "predict", help="Run inference on beat features"
     )
