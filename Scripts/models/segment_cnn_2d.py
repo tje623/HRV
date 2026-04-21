@@ -182,12 +182,18 @@ def _load_or_compute_scalogram(
     )
 
     scalogram = compute_scalogram(seg_ecg)
-    # Atomic write — prevents corruption when parallel DataLoader workers
-    # race to write the same cache file on first epoch.
-    tmp_file = cache_file.with_suffix(".npy.tmp")
+    # Atomic write — np.save appends .npy automatically, so name the temp
+    # file with a stem suffix so it still ends in .npy (avoiding double ext).
+    tmp_file = cache_file.parent / (cache_file.stem + "_tmp.npy")
     np.save(tmp_file, scalogram)
     os.replace(tmp_file, cache_file)
     return scalogram
+
+
+def _prewarm_one(args: tuple) -> None:
+    """Worker target for parallel cache pre-warm (must be module-level to pickle)."""
+    seg_idx, ecg_samples_path, cache_base = args
+    _load_or_compute_scalogram(seg_idx, ecg_samples_path, cache_base)
 
 
 def _prewarm_cache(
@@ -195,12 +201,13 @@ def _prewarm_cache(
     ecg_samples_path: str,
     cache_base: str | Path = "data/processed/scalogram_cache",
 ) -> None:
-    """Compute and cache scalograms for all segments before DataLoader workers start.
+    """Compute and cache scalograms for all segments in parallel.
 
-    Running this single-threaded before training prevents workers from racing
-    to write the same cache files and means every __getitem__ is just a fast
-    np.load() call.
+    Uses ProcessPoolExecutor so CWT (CPU-bound) runs across all cores.
+    Atomic writes mean workers never corrupt each other's files.
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     cache = _cache_dir(cache_base)
     missing = [
         int(s) for s in segment_indices
@@ -210,14 +217,20 @@ def _prewarm_cache(
         log.info("Scalogram cache: all %d segments already cached", len(segment_indices))
         return
 
+    n_workers = min(8, os.cpu_count() or 4)
     log.info(
-        "Pre-warming scalogram cache: %d/%d segments need computation — this may take a while",
-        len(missing), len(segment_indices),
+        "Pre-warming scalogram cache: %d/%d segments to compute (%d workers)",
+        len(missing), len(segment_indices), n_workers,
     )
-    for i, seg_idx in enumerate(missing):
-        _load_or_compute_scalogram(seg_idx, ecg_samples_path, cache_base)
-        if (i + 1) % 50 == 0 or (i + 1) == len(missing):
-            log.info("  Cache: %d/%d done", i + 1, len(missing))
+    args = [(s, ecg_samples_path, str(cache_base)) for s in missing]
+    done = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_prewarm_one, a): a for a in args}
+        for fut in as_completed(futures):
+            fut.result()  # re-raise any worker exception immediately
+            done += 1
+            if done % 500 == 0 or done == len(missing):
+                log.info("  Cache: %d/%d done", done, len(missing))
     log.info("Scalogram cache ready — %d segments cached", len(segment_indices))
 
 
@@ -478,7 +491,7 @@ def train(
     train_ds = SegmentScalogramDataset(ecg_samples_path, train_segs, training=True)
     val_ds = SegmentScalogramDataset(ecg_samples_path, val_segs, training=False)
 
-    n_workers = min(8, os.cpu_count() or 4)
+    n_workers = 12
     train_dl = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=n_workers, persistent_workers=True, pin_memory=True,
