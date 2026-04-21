@@ -190,47 +190,89 @@ def _load_or_compute_scalogram(
     return scalogram
 
 
-def _prewarm_one(args: tuple) -> None:
-    """Worker target for parallel cache pre-warm (must be module-level to pickle)."""
-    seg_idx, ecg_samples_path, cache_base = args
-    _load_or_compute_scalogram(seg_idx, ecg_samples_path, cache_base)
+def _compute_and_cache_ecg(args: tuple) -> None:
+    """Worker: compute scalogram from a pre-loaded ECG array and write to cache.
+
+    ECG is passed in-process — no parquet I/O inside the worker, so all
+    cores do pure CPU work (CWT) without fighting over the SSD.
+    """
+    seg_idx, ecg_array, cache_path, mtime_hash = args
+    cache_file = Path(cache_path) / f"seg_{seg_idx}_{mtime_hash}.npy"
+    if cache_file.exists():
+        return
+    scalogram = compute_scalogram(ecg_array)
+    tmp_file = cache_file.parent / (cache_file.stem + "_tmp.npy")
+    np.save(tmp_file, scalogram)
+    os.replace(tmp_file, cache_file)
 
 
 def _prewarm_cache(
     segment_indices: np.ndarray,
     ecg_samples_path: str,
     cache_base: str | Path = "data/processed/scalogram_cache",
+    batch_size: int = 500,
 ) -> None:
-    """Compute and cache scalograms for all segments in parallel.
+    """Compute and cache scalograms: sequential I/O, then parallel CWT.
 
-    Uses ProcessPoolExecutor so CWT (CPU-bound) runs across all cores.
-    Atomic writes mean workers never corrupt each other's files.
+    Pattern: main process reads one batch of ECG from parquet (sequential,
+    no SSD contention), hands pre-loaded arrays to workers who do pure
+    CPU work (CWT). Workers never touch the parquet file.
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ProcessPoolExecutor
 
     cache = _cache_dir(cache_base)
-    missing = [
+    mtime_hash = ""
+    if Path(ecg_samples_path).exists():
+        mtime_hash = hashlib.md5(
+            str(os.path.getmtime(ecg_samples_path)).encode()
+        ).hexdigest()[:8]
+
+    missing = sorted(
         int(s) for s in segment_indices
-        if not (cache / _cache_key(int(s), ecg_samples_path)).exists()
-    ]
+        if not (cache / f"seg_{int(s)}_{mtime_hash}.npy").exists()
+    )
     if not missing:
         log.info("Scalogram cache: all %d segments already cached", len(segment_indices))
         return
 
-    n_workers = min(8, os.cpu_count() or 4)
+    n_workers = min(12, os.cpu_count() or 4)
     log.info(
-        "Pre-warming scalogram cache: %d/%d segments to compute (%d workers)",
-        len(missing), len(segment_indices), n_workers,
+        "Pre-warming scalogram cache: %d/%d segments to compute (%d workers, batch=%d)",
+        len(missing), len(segment_indices), n_workers, batch_size,
     )
-    args = [(s, ecg_samples_path, str(cache_base)) for s in missing]
+
     done = 0
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_prewarm_one, a): a for a in args}
-        for fut in as_completed(futures):
-            fut.result()  # re-raise any worker exception immediately
-            done += 1
-            if done % 500 == 0 or done == len(missing):
-                log.info("  Cache: %d/%d done", done, len(missing))
+        for batch_start in range(0, len(missing), batch_size):
+            batch = missing[batch_start : batch_start + batch_size]
+            seg_min, seg_max = batch[0], batch[-1]
+
+            # One sequential range-read covers the whole batch
+            table = pq.read_table(
+                ecg_samples_path,
+                filters=[
+                    ("segment_idx", ">=", seg_min),
+                    ("segment_idx", "<=", seg_max),
+                ],
+                columns=["timestamp_ms", "ecg", "segment_idx"],
+            )
+            df = table.to_pandas()
+            ecg_by_seg = {
+                int(sid): grp.sort_values("timestamp_ms")["ecg"].values.astype(np.float64)
+                for sid, grp in df.groupby("segment_idx")
+            }
+            del table, df
+
+            worker_args = [
+                (seg, ecg_by_seg.get(seg, np.array([], dtype=np.float64)),
+                 str(cache_base), mtime_hash)
+                for seg in batch
+            ]
+            list(pool.map(_compute_and_cache_ecg, worker_args))
+
+            done += len(batch)
+            log.info("  Cache: %d/%d done", done, len(missing))
+
     log.info("Scalogram cache ready — %d segments cached", len(segment_indices))
 
 
