@@ -70,9 +70,9 @@ _SNAP_RADIUS_SEC: float = 0.060   # ±60 ms
 # the R-peak apex.  Two complementary rules:
 #   1. Neighbor ratio: keep peak only if amp >= RATIO_THRESHOLD × max(neighbor amps)
 #   2. Global floor:  keep peak only if amp >= FLOOR_FRACTION × median(all peak amps)
-_AMP_NEIGHBOR_RADIUS_MS: int   = 400    # search this many ms on each side
-_AMP_RATIO_THRESHOLD:    float = 0.30   # discard if < 30 % of max neighbor amp
-_AMP_FLOOR_FRACTION:     float = 0.20   # discard if < 20 % of global median peak amp
+_AMP_NEIGHBOR_RADIUS_MS: int   = 850    # search this many ms on each side
+_AMP_RATIO_THRESHOLD:    float = 0.25   # discard if < 30 % of max neighbor amp
+_AMP_FLOOR_FRACTION:     float = 0.15   # discard if < 15 % of global median peak amp
 
 
 def _filter_low_amplitude_peaks(
