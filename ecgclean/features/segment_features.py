@@ -12,12 +12,12 @@ carries features from five groups:
   4. EMD F-IMF statistics (entropy, mean, variance of first IMF)
   5. Raw ECG amplitude statistics (median, IQR, p95, saturation fraction)
 
-Segments with insufficient data (< 5 beats, < 256 ECG samples) will have
+Segments with insufficient data (< 5 beats, < 260 ECG samples) will have
 NaN for features that require a minimum sample size.  Specifically:
   - HRV features (group 1): NaN if < 5 non-hard-filtered beats
   - RR roughness (group 2): NaN if < 2 non-hard-filtered beats
   - SQI_QRS (group 3): NaN if < 2 clean non-hard-filtered beats
-  - EMD features (group 4): NaN if < 256 ECG samples or EMD failure
+  - EMD features (group 4): NaN if < 260 ECG samples (~2 s @ 130 Hz) or EMD failure
   - ECG amplitude (group 5): NaN if < 1 ECG sample
 
 Downstream code handles imputation — these segments are NOT dropped.
@@ -63,11 +63,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ecgclean.features.segment_features")
 
+# Polar H10 ECG sampling rate — do NOT change to 256 or 512.
+SAMPLE_RATE: int = 130
+
 # Minimum thresholds for feature computation
 _MIN_BEATS_HRV: int = 5
 _MIN_BEATS_ROUGHNESS: int = 2
 _MIN_BEATS_SQI: int = 2
-_MIN_ECG_SAMPLES_EMD: int = 256
+_MIN_ECG_SAMPLES_EMD: int = 260   # ~2 s @ 130 Hz (was 256, derived from wrong 256 Hz assumption)
 _ENTROPY_BINS: int = 100
 
 
@@ -388,7 +391,7 @@ def compute_segment_feature_matrix(
       - HRV features (group 1): if segment has < 5 non-hard-filtered beats
       - RR roughness (group 2): if segment has < 2 non-hard-filtered beats
       - sqi_qrs (group 3): if segment has < 2 clean non-hard-filtered beats
-      - EMD features (group 4): if segment has < 256 ECG samples or EMD fails
+      - EMD features (group 4): if segment has < 260 ECG samples (~2 s @ 130 Hz) or EMD fails
       - ECG amplitude (group 5): if segment has 0 ECG samples
 
     Args:
@@ -396,7 +399,7 @@ def compute_segment_feature_matrix(
         labels_df: Enriched labels table (peak_id, label, hard_filtered,
             rr_prev_ms, review_priority_score).
         ecg_samples_df: ECG samples table (timestamp_ns, ecg, segment_idx).
-        ecg_windows: ECG window array (n_beats, 64), aligned to peaks_df
+        ecg_windows: ECG window array (n_beats, 65), aligned to peaks_df
             row order.
 
     Returns:
@@ -453,7 +456,7 @@ def compute_segment_feature_matrix(
 
         # ── Beat windows for this segment ─────────────────────────────────
         beat_rows = seg_beats["_peak_row"].values.astype(int)
-        seg_windows = ecg_windows[beat_rows] if len(beat_rows) > 0 else np.empty((0, 64))
+        seg_windows = ecg_windows[beat_rows] if len(beat_rows) > 0 else np.empty((0, 65))
 
         # ── Feature group 1: HRV ──────────────────────────────────────────
         hrv = _compute_hrv_features(rr_ms)
@@ -510,7 +513,7 @@ def compute_segment_feature_matrix(
 def _load_ecg_windows(
     peaks_df: pd.DataFrame,
     ecg_samples_df: pd.DataFrame,
-    window_size: int = 64,
+    window_size: int = 65,
 ) -> np.ndarray:
     """Reconstruct ECG windows from ecg_samples for each peak.
 
@@ -520,7 +523,7 @@ def _load_ecg_windows(
     Args:
         peaks_df: Peaks table with timestamp_ns.
         ecg_samples_df: ECG samples table with timestamp_ns and ecg.
-        window_size: Number of ECG samples per window (default 64).
+        window_size: Number of ECG samples per window (default 65 = 0.5 s @ 130 Hz).
 
     Returns:
         numpy array of shape (n_peaks, window_size), dtype float32.
