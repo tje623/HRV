@@ -47,7 +47,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import random
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,28 +91,30 @@ SAMPLE_RATE: int = 256
 WINDOW_SIZE: int = 256
 
 TABULAR_COLUMNS: list[str] = [
-    "rr_prev",
-    "rr_next",
-    "rr_ratio",
-    "rr_diff",
-    "rr_mean",
-    "rr_prev_2",
-    "rr_next_2",
-    "rr_local_mean_5",
-    "rr_local_sd_5",
-    "rr_abs_delta_prev",
-    "rr_abs_delta_next",
-    "qrs_corr_to_template",
-    "qrs_corr_prev",
-    "qrs_corr_next",
+    # ── RR interval context (Feature Groups 1 + 2) ───────────────────────
+    "rr_prev", "rr_next", "rr_ratio", "rr_diff", "rr_mean",
+    "rr_prev_2", "rr_next_2",
+    "rr_local_mean_5", "rr_local_sd_5",
+    "rr_abs_delta_prev", "rr_abs_delta_next", "rr_delta_ratio_next",
+    # ── QRS morphology + global template (Group 3) ────────────────────────
+    "qrs_corr_to_template", "qrs_corr_prev", "qrs_corr_next",
+    "global_corr_clean",
+    # ── Raw ECG window statistics (Group 1 legacy) ────────────────────────
+    "window_mean", "window_std", "window_ptp", "window_min", "window_max",
+    # ── Label-free signal quality (Group 6) ──────────────────────────────
+    "window_iqr", "window_kurtosis", "window_zcr",
+    "r_peak_snr", "window_hf_noise_rms", "window_wander_slope",
+    "window_energy_ratio",
+    # ── Physiological constraint flags (Group 4) ──────────────────────────
     "physio_implausible",
-    "pots_transition_candidate",
-    "rr_suspicious_short",
-    "rr_suspicious_long",
+    "pots_transition_candidate", "tachy_transition_candidate",
+    "hr_suspicious_low", "hr_suspicious_high",
+    "rr_suspicious_short", "rr_suspicious_long",
+    "is_added_peak",
+    # ── Segment-level context (Group 5) ──────────────────────────────────
     "review_priority_score",
-    "segment_artifact_fraction",
-    "segment_rr_sd",
-    "segment_quality_pred",
+    "segment_artifact_fraction", "segment_rr_sd",
+    "segment_clean_beat_count", "segment_quality_pred",
 ]
 
 ARTIFACT_TYPES: list[str] = [
@@ -693,6 +697,7 @@ def train(
     batch_size: int = 512,
     augment_fraction: float = 0.10,
     random_seed: int = 42,
+    num_workers: int = 4,
 ) -> dict:
     """Train the hybrid CNN + tabular beat artifact classifier.
 
@@ -840,6 +845,27 @@ def train(
         merged = merged[merged["label"] != "interpolated"].copy()
         logger.info("Excluded %d interpolated beats from training", n_interp)
 
+    # ── Restrict to reviewed beats only ───────────────────────────────────
+    # Unreviewed beats carry a default "clean" label that was never actually
+    # verified — training on them injects corrupted negatives and tanks
+    # PR-AUC.  Same policy as beat_artifact_tabular.py.
+    if "reviewed" in merged.columns:
+        n_before = len(merged)
+        merged = merged[merged["reviewed"].astype(bool)].copy()
+        n_excl = n_before - len(merged)
+        if n_excl > 0:
+            logger.info(
+                "Restricted to reviewed beats: %d excluded (unreviewed), "
+                "%d remain",
+                n_excl,
+                len(merged),
+            )
+    else:
+        logger.warning(
+            "No 'reviewed' column in labels — all beats used for training. "
+            "Re-run data_pipeline.py to add reviewed labels."
+        )
+
     # ── Temporal split by segment_idx ─────────────────────────────────────
     unique_segments = sorted(merged["segment_idx"].unique())
     n_segments = len(unique_segments)
@@ -913,11 +939,10 @@ def train(
         else None
     )
 
-    # ── WeightedRandomSampler: oversample artifacts 15× ───────────────────
+    # ── WeightedRandomSampler: oversample artifacts 15× (vectorised) ─────
+    artifact_mask = torch.from_numpy(train_dataset.labels == 1.0)
     sample_weights = torch.ones(len(train_dataset))
-    for i in range(len(train_dataset)):
-        if train_dataset.labels[i] == 1.0:
-            sample_weights[i] = 15.0
+    sample_weights[artifact_mask] = 15.0
 
     sampler = WeightedRandomSampler(
         weights=sample_weights,
@@ -929,8 +954,9 @@ def train(
         train_dataset,
         batch_size=min(batch_size, len(train_dataset)),
         sampler=sampler,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=False,
+        persistent_workers=(num_workers > 0),
     )
 
     val_loader = (
@@ -938,7 +964,8 @@ def train(
             val_dataset,
             batch_size=min(batch_size, len(val_dataset)),
             shuffle=False,
-            num_workers=0,
+            num_workers=num_workers,
+            persistent_workers=(num_workers > 0),
         )
         if val_dataset is not None
         else None
@@ -959,6 +986,12 @@ def train(
     callbacks: list[pl.Callback] = []
 
     ckpt_dir = Path(output_model_path).parent / "cnn_checkpoints"
+    # Always start fresh — stale checkpoints from prior runs cause Lightning
+    # to warn and can load wrong weights if the model architecture changed.
+    if ckpt_dir.exists():
+        shutil.rmtree(ckpt_dir)
+        logger.info("Removed stale checkpoint directory: %s", ckpt_dir)
+
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         monitor="val_pr_auc" if val_loader else None,
@@ -1231,6 +1264,7 @@ def _cli_train(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         augment_fraction=args.augment_fraction,
         random_seed=args.seed,
+        num_workers=args.num_workers,
     )
 
 
@@ -1481,6 +1515,14 @@ def main() -> None:
     tp.add_argument(
         "--seed", type=int, default=42,
         help="Random seed (default: 42)",
+    )
+    tp.add_argument(
+        "--num-workers", type=int,
+        default=min(4, max(1, (os.cpu_count() or 4) - 2)),
+        help=(
+            "DataLoader worker processes for data prefetching "
+            "(default: min(4, cpu_count-2)).  Set 0 to disable."
+        ),
     )
 
     # ── predict ───────────────────────────────────────────────────────────
