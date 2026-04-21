@@ -107,7 +107,7 @@ logging.basicConfig(
 
 # ─── Constants ──────────────────────────────────────────────────────
 SAMPLE_RATE: int = 125  # Polar H10 ECG sampling rate (empirically 8.000 ms/sample = 125 Hz)
-WINDOW_SIZE: int = 256
+WINDOW_SIZE: int = 125  # 1 second at 125 Hz (was 256, designed for "256 samples @ 256 Hz")
 
 # Sparkline characters for ASCII waveform rendering
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
@@ -123,10 +123,10 @@ def _extract_windows(
     peak_segment_ids: np.ndarray,
     ecg_samples_df: pd.DataFrame,
 ) -> np.ndarray:
-    """Extract and bandpass-filter 256-sample ECG windows for all peaks.
+    """Extract and bandpass-filter ECG windows (WINDOW_SIZE samples) for all peaks.
 
     For each peak, a 1-second window centred on the R-peak timestamp is
-    constructed by linear interpolation of the raw ECG samples at 256 Hz.
+    constructed by linear interpolation of the raw ECG samples at 125 Hz.
     If no ECG data is available for a peak's segment, the window is
     all-zeros (zero-padded).
 
@@ -140,7 +140,7 @@ def _extract_windows(
             ``timestamp_ns``, ``ecg``, ``segment_idx``.
 
     Returns:
-        Array of shape ``(n_beats, 256)`` with filtered windows (float32).
+        Array of shape ``(n_beats, WINDOW_SIZE)`` with filtered windows (float32).
     """
     n_beats = len(peak_timestamps_ns)
     windows = np.zeros((n_beats, WINDOW_SIZE), dtype=np.float32)
@@ -225,7 +225,7 @@ def corrupt_ecg_window(
     here for consistency.
 
     Args:
-        window: 1-D float32 array of shape ``(256,)``.
+        window: 1-D float32 array of shape ``(WINDOW_SIZE,)``.
         corruption_level: Corruption intensity in [0, 1].
 
     Returns:
@@ -352,7 +352,7 @@ class PretrainDataset(Dataset):
 
     Returns:
         ``(corrupted_window_tensor, clean_window_tensor)`` of shape
-        ``(1, 256)`` each (single channel).
+        ``(1, WINDOW_SIZE)`` each (single channel).
     """
 
     def __init__(
@@ -364,7 +364,7 @@ class PretrainDataset(Dataset):
 
         Args:
             windows: Pre-extracted, bandpass-filtered, normalised ECG
-                windows of shape ``(n_beats, 256)``.
+                windows of shape ``(n_beats, WINDOW_SIZE)``.
             corruption_level: Corruption intensity for the denoising task.
         """
         super().__init__()
@@ -378,8 +378,8 @@ class PretrainDataset(Dataset):
         clean = self.windows[idx].copy()
         corrupted = corrupt_ecg_window(clean, self.corruption_level)
 
-        clean_t = torch.from_numpy(clean).unsqueeze(0)  # [1, 256]
-        corrupted_t = torch.from_numpy(corrupted).unsqueeze(0)  # [1, 256]
+        clean_t = torch.from_numpy(clean).unsqueeze(0)  # [1, WINDOW_SIZE]
+        corrupted_t = torch.from_numpy(corrupted).unsqueeze(0)  # [1, WINDOW_SIZE]
 
         # Safety: no NaN allowed
         assert not torch.isnan(clean_t).any(), f"NaN in clean window at idx={idx}"
@@ -399,7 +399,7 @@ class ECGDenoisingAutoencoder(pl.LightningModule):
     The **encoder** is architecturally identical to the CNN branch of
     ``BeatArtifactCNN`` in ``beat_artifact_cnn.py``::
 
-        Input: [B, 1, 256]
+        Input: [B, 1, WINDOW_SIZE]
         Conv1d(1, 32, 7, padding=3) → BN → ReLU
         Conv1d(32, 64, 5, padding=2) → BN → ReLU → MaxPool1d(2)  → [B, 64, 128]
         Conv1d(64, 128, 5, padding=2) → BN → ReLU → MaxPool1d(2) → [B, 128, 64]
@@ -413,7 +413,7 @@ class ECGDenoisingAutoencoder(pl.LightningModule):
         ConvTranspose1d(128, 64, 4, stride=2, padding=1) → BN → ReLU  → [B, 64, 32]
         ConvTranspose1d(64, 32, 4, stride=2, padding=1) → BN → ReLU   → [B, 32, 64]
         ConvTranspose1d(32, 16, 4, stride=2, padding=1) → BN → ReLU   → [B, 16, 128]
-        ConvTranspose1d(16, 1, 4, stride=2, padding=1)                 → [B, 1, 256]
+        ConvTranspose1d(16, 1, 4, stride=2, padding=1)                 → [B, 1, WINDOW_SIZE]
 
     Loss: MSE between reconstructed and original clean window.
 
@@ -476,22 +476,22 @@ class ECGDenoisingAutoencoder(pl.LightningModule):
         """Forward pass: encode corrupted window, decode to reconstruction.
 
         Args:
-            corrupted_window: Tensor of shape ``[B, 1, 256]``.
+            corrupted_window: Tensor of shape ``[B, 1, WINDOW_SIZE]``.
 
         Returns:
-            Reconstructed window tensor of shape ``[B, 1, 256]``.
+            Reconstructed window tensor of shape ``[B, 1, WINDOW_SIZE]``.
         """
         embedding = self.encoder(corrupted_window)  # [B, 128]
         decoded = self.decoder_linear(embedding)  # [B, 128*16]
         decoded = decoded.view(-1, 128, 16)  # [B, 128, 16]
-        reconstructed = self.decoder_convs(decoded)  # [B, 1, 256]
+        reconstructed = self.decoder_convs(decoded)  # [B, 1, WINDOW_SIZE]
         return reconstructed
 
     def encode(self, window: torch.Tensor) -> torch.Tensor:
         """Extract the 128-dim embedding (encoder only, no decoder).
 
         Args:
-            window: Tensor of shape ``[B, 1, 256]``.
+            window: Tensor of shape ``[B, 1, WINDOW_SIZE]``.
 
         Returns:
             Embedding tensor of shape ``[B, 128]``.
@@ -525,7 +525,7 @@ class ECGDenoisingAutoencoder(pl.LightningModule):
         """Training step: reconstruct clean from corrupted.
 
         Args:
-            batch: ``(corrupted, clean)`` tensors of shape ``[B, 1, 256]``.
+            batch: ``(corrupted, clean)`` tensors of shape ``[B, 1, WINDOW_SIZE]``.
             batch_idx: Batch index.
 
         Returns:
@@ -543,7 +543,7 @@ class ECGDenoisingAutoencoder(pl.LightningModule):
         """Validation step: MSE loss and reconstruction SNR.
 
         Args:
-            batch: ``(corrupted, clean)`` tensors of shape ``[B, 1, 256]``.
+            batch: ``(corrupted, clean)`` tensors of shape ``[B, 1, WINDOW_SIZE]``.
             batch_idx: Batch index.
         """
         corrupted, clean = batch
@@ -699,7 +699,7 @@ def _prepare_windows(
 
     Returns:
         Tuple of (normalised_windows, segment_ids) where normalised_windows
-        has shape ``(n_beats, 256)`` and segment_ids has shape ``(n_beats,)``.
+        has shape ``(n_beats, WINDOW_SIZE)`` and segment_ids has shape ``(n_beats,)``.
     """
     peaks_df = pd.read_parquet(peaks_path)
     ecg_samples_df = pd.read_parquet(ecg_samples_path)
@@ -1035,7 +1035,7 @@ def visualize_reconstruction(
         clean = windows[idx].copy()
         corrupted = corrupt_ecg_window(clean, corruption_level=0.5)
 
-        clean_t = torch.from_numpy(clean).unsqueeze(0).unsqueeze(0)  # [1, 1, 256]
+        clean_t = torch.from_numpy(clean).unsqueeze(0).unsqueeze(0)  # [1, 1, WINDOW_SIZE]
         corrupted_t = torch.from_numpy(corrupted).unsqueeze(0).unsqueeze(0)
 
         with torch.no_grad():

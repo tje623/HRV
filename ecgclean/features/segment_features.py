@@ -63,14 +63,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ecgclean.features.segment_features")
 
-# Polar H10 ECG sampling rate — do NOT change to 256 or 512.
-SAMPLE_RATE: int = 130
+# Polar H10 ECG sampling rate — do NOT change to 256, 130, or 512.
+SAMPLE_RATE: int = 125  # empirically 8.000 ms/sample = 125 Hz
 
 # Minimum thresholds for feature computation
 _MIN_BEATS_HRV: int = 5
 _MIN_BEATS_ROUGHNESS: int = 2
 _MIN_BEATS_SQI: int = 2
-_MIN_ECG_SAMPLES_EMD: int = 260   # ~2 s @ 130 Hz (was 256, derived from wrong 256 Hz assumption)
+_MIN_ECG_SAMPLES_EMD: int = 250   # ~2 s @ 125 Hz
 _ENTROPY_BINS: int = 100
 
 

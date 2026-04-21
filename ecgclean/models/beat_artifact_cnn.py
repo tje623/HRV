@@ -45,7 +45,7 @@ def _get_device() -> torch.device:
 # Constants
 
 SAMPLE_RATE: int = 125  # Polar H10 ECG sampling rate (empirically 8.000 ms/sample = 125 Hz)
-WINDOW_SIZE: int = 256
+WINDOW_SIZE: int = 125  # 1 second at 125 Hz (was 256, designed for "256 samples @ 256 Hz")
 
 TABULAR_COLUMNS: list[str] = [
     # RR interval context
@@ -214,8 +214,8 @@ def _extract_windows(
     # Window extraction: vectorised per-segment (not per-beat)
     # Outer loop is over unique segments (~few thousand per chunk), not over
     # individual beats (~millions).  All beats in a segment are interpolated
-    # in a single np.interp call on the flattened (k×256,) target array.
-    offsets = np.arange(WINDOW_SIZE, dtype=np.int64) * sample_interval_ns  # (256,)
+    # in a single np.interp call on the flattened (k×WINDOW_SIZE,) target array.
+    offsets = np.arange(WINDOW_SIZE, dtype=np.int64) * sample_interval_ns  # (WINDOW_SIZE,)
     n_with_data = 0
 
     for seg_idx, (seg_ts, seg_ecg) in ecg_by_seg.items():
@@ -227,7 +227,7 @@ def _extract_windows(
 
         peak_ts_seg = peak_timestamps_ns[beat_mask]          # (k,)
         t_starts = peak_ts_seg - half_window * sample_interval_ns  # (k,)
-        target_ts = (t_starts[:, None] + offsets[None, :]).ravel()  # (k×256,)
+        target_ts = (t_starts[:, None] + offsets[None, :]).ravel()  # (k×WINDOW_SIZE,)
 
         flat = np.interp(
             target_ts.astype(np.float64),
@@ -270,7 +270,7 @@ def _extract_windows(
 
 
 class BeatDataset(Dataset):
-    """Pre-extracts and bandpass-filters all 256-sample ECG windows during
+    """Pre-extracts and bandpass-filters all ECG windows (WINDOW_SIZE samples) during
     ``__init__`` for efficiency."""
 
     def __init__(
@@ -326,7 +326,7 @@ class BeatDataset(Dataset):
         sigma = float(window.std()) + 1e-8
         window = (window - mu) / sigma
 
-        window_t = torch.from_numpy(window).float().unsqueeze(0)  # [1, 256]
+        window_t = torch.from_numpy(window).float().unsqueeze(0)  # [1, WINDOW_SIZE]
         tabular_t = torch.from_numpy(tabular).float()
         label_t = torch.tensor(label, dtype=torch.float32)
 
@@ -357,7 +357,7 @@ class BeatArtifactCNN(pl.LightningModule):
         self.save_hyperparameters()
         self.learning_rate = learning_rate
 
-        # CNN branch: [B, 1, 256] → [B, 128]
+        # CNN branch: [B, 1, WINDOW_SIZE] → [B, 128]
         self.cnn = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.BatchNorm1d(32),
@@ -1156,7 +1156,7 @@ def _cli_predict(args: argparse.Namespace) -> None:
                 columns=["timestamp_ns", "ecg", "segment_idx"],
             ).to_pandas().sort_values("timestamp_ns").reset_index(drop=True)
 
-            # Extract and bandpass-filter 256-sample windows
+            # Extract and bandpass-filter ECG windows
             windows = _extract_windows(
                 chunk_df["timestamp_ns"].values.astype(np.int64),
                 chunk_df["segment_idx"].values.astype(np.int64),
@@ -1170,14 +1170,14 @@ def _cli_predict(args: argparse.Namespace) -> None:
 
             chunk_probas: list[float] = []
             for b in range(0, len(chunk_df), batch_size):
-                win_b = windows[b : b + batch_size].copy()  # (B, 256)
+                win_b = windows[b : b + batch_size].copy()  # (B, WINDOW_SIZE)
                 tab_b = tabular[b : b + batch_size]
 
                 mu = win_b.mean(axis=-1, keepdims=True)
                 sigma = win_b.std(axis=-1, keepdims=True) + 1e-8
                 win_b = (win_b - mu) / sigma
 
-                win_t = torch.from_numpy(win_b).float().unsqueeze(1).to(device)  # [B, 1, 256]
+                win_t = torch.from_numpy(win_b).float().unsqueeze(1).to(device)  # [B, 1, WINDOW_SIZE]
                 tab_t = torch.from_numpy(tab_b).float().to(device)
 
                 with torch.no_grad():
