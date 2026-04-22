@@ -30,6 +30,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from sklearn.cluster import KMeans
 
 # ---------------------------------------------------------------------------
@@ -65,61 +66,99 @@ from config import (
 # ===================================================================== #
 #  ECG window extraction                                                #
 # ===================================================================== #
-def _load_ecg_windows(
-    peaks_df: pd.DataFrame,
-    ecg_samples_path: str,
-    window_size: int = QRS_WINDOW_SAMPLES,
+def _extract_windows_from_arrays(
+    peak_ts: np.ndarray,
+    ecg_ts: np.ndarray,
+    ecg_vals: np.ndarray,
+    window_size: int,
 ) -> np.ndarray:
-    """Extract ECG windows centered on each R-peak.
-
-    Parameters
-    ----------
-    peaks_df : pd.DataFrame
-        Must have ``peak_id`` and ``timestamp_ms``.
-    ecg_samples_path : str
-        Path to ``ecg_samples.parquet``.
-    window_size : int
-        Number of samples per window (default ``QRS_WINDOW_SAMPLES`` = 65).
-
-    Returns
-    -------
-    np.ndarray
-        Shape ``(n_peaks, window_size)``, dtype float32.
-    """
-    ecg_samples = pd.read_parquet(ecg_samples_path)
-    n_peaks = len(peaks_df)
-    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
-
-    ecg_ts = ecg_samples["timestamp_ms"].values.astype(np.int64)
-    ecg_vals = ecg_samples["ecg"].values.astype(np.float32)
+    """Extract ECG windows from pre-loaded sorted ECG arrays."""
+    n = len(peak_ts)
+    windows = np.zeros((n, window_size), dtype=np.float32)
     n_ecg = len(ecg_ts)
-
     if n_ecg == 0:
-        log.warning("No ECG samples available for window extraction")
         return windows
-
-    peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     half = window_size // 2
-
     insert_idx = np.searchsorted(ecg_ts, peak_ts, side="left")
-
-    for i in range(n_peaks):
+    for i in range(n):
         center = int(insert_idx[i])
-        if center > 0 and center < n_ecg:
+        if 0 < center < n_ecg:
             if abs(ecg_ts[center - 1] - peak_ts[i]) < abs(ecg_ts[center] - peak_ts[i]):
                 center -= 1
         elif center >= n_ecg:
             center = n_ecg - 1
-
         start = center - half
-        end = start + window_size
         src_start = max(0, start)
-        src_end = min(n_ecg, end)
+        src_end = min(n_ecg, start + window_size)
         dst_start = src_start - start
         dst_end = dst_start + (src_end - src_start)
-
         if src_end > src_start:
             windows[i, dst_start:dst_end] = ecg_vals[src_start:src_end]
+    return windows
+
+
+def _load_ecg_windows(
+    peaks_df: pd.DataFrame,
+    ecg_samples_path: str,
+    window_size: int = QRS_WINDOW_SAMPLES,
+    seg_batch: int = 100,
+) -> np.ndarray:
+    """Extract ECG windows centered on each R-peak.
+
+    Streams ECG in batches of ``seg_batch`` segments via parquet predicate
+    pushdown — never loads the full ECG table into memory.
+
+    Parameters
+    ----------
+    peaks_df : pd.DataFrame
+        Must have ``peak_id``, ``timestamp_ms``, ``segment_idx``.
+    ecg_samples_path : str
+        Path to ``ecg_samples.parquet``.
+    window_size : int
+        Samples per window (default ``QRS_WINDOW_SAMPLES``).
+    seg_batch : int
+        Segments to read per parquet fetch (default 100).
+
+    Returns
+    -------
+    np.ndarray shape ``(n_peaks, window_size)``, dtype float32.
+    """
+    n_peaks = len(peaks_df)
+    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
+
+    peaks_idx = peaks_df[["timestamp_ms", "segment_idx"]].copy()
+    peaks_idx["_pos"] = np.arange(n_peaks)
+
+    all_segs = sorted(peaks_idx["segment_idx"].unique())
+    log.info(
+        "Loading ECG windows: %d peaks across %d segments (batch=%d)",
+        n_peaks, len(all_segs), seg_batch,
+    )
+
+    for batch_start in range(0, len(all_segs), seg_batch):
+        batch_segs = all_segs[batch_start : batch_start + seg_batch]
+        seg_min, seg_max = int(batch_segs[0]), int(batch_segs[-1])
+
+        table = pq.read_table(
+            ecg_samples_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+            columns=["timestamp_ms", "ecg"],
+        )
+        ecg_df = table.to_pandas().sort_values("timestamp_ms")
+        ecg_ts = ecg_df["timestamp_ms"].values.astype(np.int64)
+        ecg_vals = ecg_df["ecg"].values.astype(np.float32)
+        del table, ecg_df
+
+        batch_peaks = peaks_idx[peaks_idx["segment_idx"].isin(batch_segs)]
+        batch_windows = _extract_windows_from_arrays(
+            batch_peaks["timestamp_ms"].values.astype(np.int64),
+            ecg_ts, ecg_vals, window_size,
+        )
+        windows[batch_peaks["_pos"].values] = batch_windows
+        del ecg_ts, ecg_vals, batch_windows
 
     return windows
 
@@ -475,13 +514,18 @@ def compute_motif_features(
     qrs_centroids = qrs_motif_dict["centroids"]
     qrs_labels = qrs_motif_dict["cluster_labels"]
 
-    qrs_dists = np.linalg.norm(
-        ecg_windows[:, np.newaxis, :] - qrs_centroids[np.newaxis, :, :],
-        axis=2,
-    )
+    # Chunked to avoid (n_beats, n_clusters, window_size) intermediates.
+    _DIST_CHUNK = 50_000
+    nearest_qrs_idx = np.empty(n, dtype=np.int32)
+    nearest_qrs_dist = np.empty(n, dtype=np.float32)
+    for _i in range(0, n, _DIST_CHUNK):
+        _b = ecg_windows[_i : _i + _DIST_CHUNK].astype(np.float32)
+        _d = np.linalg.norm(_b[:, np.newaxis, :] - qrs_centroids[np.newaxis, :, :], axis=2)
+        nearest_qrs_idx[_i : _i + _DIST_CHUNK] = _d.argmin(axis=1)
+        nearest_qrs_dist[_i : _i + _DIST_CHUNK] = _d[
+            np.arange(len(_b)), nearest_qrs_idx[_i : _i + _DIST_CHUNK]
+        ]
 
-    nearest_qrs_idx = qrs_dists.argmin(axis=1)
-    nearest_qrs_dist = qrs_dists[np.arange(n), nearest_qrs_idx]
     nearest_qrs_label = [qrs_labels[int(i)] for i in nearest_qrs_idx]
 
     # ── RR distances ─────────────────────────────────────────────────
@@ -509,13 +553,16 @@ def compute_motif_features(
         dst_end = dst_start + (src_end - src_start)
         rr_windows[i, dst_start:dst_end] = rr_filled[src_start:src_end]
 
-    rr_dists = np.linalg.norm(
-        rr_windows[:, np.newaxis, :] - rr_centroids[np.newaxis, :, :],
-        axis=2,
-    )
+    nearest_rr_idx = np.empty(n, dtype=np.int32)
+    nearest_rr_dist = np.empty(n, dtype=np.float32)
+    for _i in range(0, n, _DIST_CHUNK):
+        _b = rr_windows[_i : _i + _DIST_CHUNK]
+        _d = np.linalg.norm(_b[:, np.newaxis, :] - rr_centroids[np.newaxis, :, :], axis=2)
+        nearest_rr_idx[_i : _i + _DIST_CHUNK] = _d.argmin(axis=1)
+        nearest_rr_dist[_i : _i + _DIST_CHUNK] = _d[
+            np.arange(len(_b)), nearest_rr_idx[_i : _i + _DIST_CHUNK]
+        ]
 
-    nearest_rr_idx = rr_dists.argmin(axis=1)
-    nearest_rr_dist = rr_dists[np.arange(n), nearest_rr_idx]
     nearest_rr_label = [rr_labels[int(i)] for i in nearest_rr_idx]
 
     # ── Anomaly scores (normalized by mean clean-beat distance) ──────
@@ -643,6 +690,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
 
+    _MAX_DISCOVERY_BEATS = 200_000  # k-means doesn't need all 50M beats
+
     if args.command == "discover":
         bf_path = Path(args.beat_features)
         proc_dir = bf_path.parent
@@ -653,12 +702,26 @@ def main() -> None:
 
         log.info("Loaded: %d peaks, %d labels", len(peaks_df), len(labels_df))
 
-        ecg_windows = _load_ecg_windows(peaks_df, ecg_samples_path)
+        # Sample beats for clustering — centroids don't improve with >200K examples
+        merged_lbl = peaks_df[["peak_id", "segment_idx", "timestamp_ms"]].merge(
+            labels_df[["peak_id", "label", "hard_filtered"]], on="peak_id", how="left",
+        )
+        clean_mask = (merged_lbl["label"] == "clean") & (~merged_lbl["hard_filtered"].fillna(False))
+        clean_peaks = merged_lbl[clean_mask]
+        if len(clean_peaks) > _MAX_DISCOVERY_BEATS:
+            clean_peaks = clean_peaks.sample(_MAX_DISCOVERY_BEATS, random_state=42)
+            log.info("Sampled %d clean beats for motif discovery", _MAX_DISCOVERY_BEATS)
+        else:
+            log.info("Using all %d clean beats for motif discovery", len(clean_peaks))
+
+        ecg_windows = _load_ecg_windows(clean_peaks, ecg_samples_path)
         log.info("ECG windows shape: %s", ecg_windows.shape)
 
+        # Pass sampled peaks to QRS motifs; full peaks_df to RR (no ECG needed)
         qrs_motifs = discover_qrs_motifs(
-            peaks_df, labels_df, ecg_windows,
+            clean_peaks, labels_df, ecg_windows,
             n_clusters=args.n_qrs_clusters,
+            use_clean_only=False,  # already filtered to clean
         )
         rr_motifs = discover_rr_motifs(
             peaks_df, labels_df,
@@ -706,6 +769,9 @@ def main() -> None:
         print(f"{'=' * 72}")
 
     elif args.command == "compute":
+        import pyarrow as pa
+        import pyarrow.parquet as pq_out
+
         bf_path = Path(args.beat_features)
         proc_dir = bf_path.parent
 
@@ -713,18 +779,55 @@ def main() -> None:
         labels_df = pd.read_parquet(args.labels)
         ecg_samples_path = str(proc_dir / "ecg_samples.parquet")
 
-        ecg_windows = _load_ecg_windows(peaks_df, ecg_samples_path)
-
         qrs_motifs, rr_motifs = load_motifs(args.motifs)
-
-        result = compute_motif_features(
-            peaks_df, labels_df, ecg_windows, qrs_motifs, rr_motifs,
-        )
 
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
-        result.to_parquet(out, index=False, compression="snappy")
+
+        # Stream by segment chunk — never load all ECG windows at once
+        _COMPUTE_CHUNK = 500
+        peaks_sorted = peaks_df.sort_values("segment_idx").reset_index(drop=True)
+        all_segs = sorted(peaks_sorted["segment_idx"].unique())
+        seg_arr = peaks_sorted["segment_idx"].values
+        writer = None
+
+        log.info(
+            "Computing motif features: %d peaks across %d segments (chunk=%d)",
+            len(peaks_sorted), len(all_segs), _COMPUTE_CHUNK,
+        )
+
+        for chunk_start in range(0, len(all_segs), _COMPUTE_CHUNK):
+            chunk_segs = all_segs[chunk_start : chunk_start + _COMPUTE_CHUNK]
+            seg_min, seg_max = int(chunk_segs[0]), int(chunk_segs[-1])
+
+            lo = int(np.searchsorted(seg_arr, seg_min, side="left"))
+            hi = int(np.searchsorted(seg_arr, seg_max + 1, side="left"))
+            chunk_peaks = peaks_sorted.iloc[lo:hi].reset_index(drop=True)
+
+            chunk_windows = _load_ecg_windows(chunk_peaks, ecg_samples_path)
+
+            chunk_result = compute_motif_features(
+                chunk_peaks, labels_df, chunk_windows, qrs_motifs, rr_motifs,
+            )
+            del chunk_windows
+
+            table = pa.Table.from_pandas(chunk_result, preserve_index=False)
+            if writer is None:
+                writer = pq_out.ParquetWriter(out, table.schema, compression="snappy")
+            writer.write_table(table)
+
+            log.info(
+                "  Chunk %d–%d done (%d peaks)",
+                chunk_start // _COMPUTE_CHUNK + 1,
+                (chunk_start + _COMPUTE_CHUNK - 1) // _COMPUTE_CHUNK + 1,
+                len(chunk_peaks),
+            )
+
+        if writer:
+            writer.close()
         log.info("Saved motif features → %s", out)
+
+        result = pd.read_parquet(out)
 
         n = len(result)
         print(f"\n{'=' * 72}")
