@@ -81,14 +81,6 @@ logger = logging.getLogger("ecgclean.models.beat_artifact_tabular")
 
 # ── Default LightGBM parameters ──────────────────────────────────────────────
 
-# Features computed from existing artifact labels that cause training leakage.
-# They encode the current label distribution directly, so the model learns to
-# regurgitate label counts rather than detect artifacts from beat morphology.
-# Excluded from training; stored feature_columns are kept consistent so
-# prediction never sees them either (both sides of the model see the same set).
-_LABEL_LEAKAGE_FEATURES: frozenset[str] = frozenset({
-    "segment_artifact_fraction",
-})
 
 DEFAULT_LGBM_PARAMS: dict[str, Any] = {
     "objective": "binary",
@@ -327,15 +319,7 @@ def train(
     # ── Identify feature columns (before any joins) ───────────────────────
     if features_df.index.name == "peak_id":
         features_df = features_df.reset_index()
-    feature_cols = [
-        c for c in features_df.columns
-        if c != "peak_id" and c not in _LABEL_LEAKAGE_FEATURES
-    ]
-    excluded_leaky = [c for c in features_df.columns if c in _LABEL_LEAKAGE_FEATURES]
-    if excluded_leaky:
-        logger.info(
-            "Excluded label-leakage features from training: %s", excluded_leaky
-        )
+    feature_cols = [c for c in features_df.columns if c != "peak_id"]
     logger.info("Feature columns (%d): %s", len(feature_cols), feature_cols)
 
     # ── Merge: features + labels + peaks + segment quality ────────────────
@@ -431,18 +415,28 @@ def train(
         logger.info("Excluded %d interpolated beats from training", n_interp)
 
     # ── Restrict to reviewed beats only ───────────────────────────────────
-    # Only beats from manually annotated segments carry ground-truth labels.
     # Unreviewed beats have label='clean' by pipeline default but were never
-    # inspected — using them as negative examples would corrupt the model.
+    # inspected — using them as negatives corrupts the model.
+    # EXCEPTION: artifact-labeled beats are always kept regardless of the
+    # reviewed flag. A beat labeled "artifact" was reviewed by definition;
+    # an unset reviewed flag just means the flag wasn't propagated correctly.
     if "reviewed" in merged.columns:
         n_before = len(merged)
-        merged = merged[merged["reviewed"]].copy()
+        keep_mask = merged["reviewed"] | (merged["label"] == "artifact")
+        merged = merged[keep_mask].copy()
         n_excluded = n_before - len(merged)
+        n_artifact_rescued = int(
+            (~merged["reviewed"] & (merged["label"] == "artifact")).sum()
+            if "reviewed" in merged.columns else 0
+        )
         if n_excluded > 0:
             logger.info(
-                "Restricted to reviewed beats: %d excluded (unreviewed), %d remain",
+                "Restricted to reviewed beats + artifact-labeled: "
+                "%d unreviewed non-artifact beats excluded, %d remain "
+                "(%d artifact beats kept despite unset reviewed flag)",
                 n_excluded,
                 len(merged),
+                n_artifact_rescued,
             )
     else:
         logger.warning(
