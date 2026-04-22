@@ -275,8 +275,16 @@ def discover_qrs_motifs(
         selection = merged.copy()
 
     row_indices = selection["_row"].values
-    selected_windows = ecg_windows[row_indices]
+    selected_windows = ecg_windows[row_indices].astype(np.float64)
     selected_peak_ids = selection["peak_id"].values
+
+    # Per-beat z-score normalization — removes amplitude/baseline, keeps morphology.
+    # Without this, one high-amplitude beat creates its own cluster and k-means
+    # collapses into degenerate amplitude-dominated singletons.
+    _eps = 1e-8
+    _w_mean = selected_windows.mean(axis=1, keepdims=True)
+    _w_std = selected_windows.std(axis=1, keepdims=True)
+    selected_windows_norm = (selected_windows - _w_mean) / (_w_std + _eps)
 
     log.info("QRS motif discovery: %d beats, %d clusters", len(selection), n_clusters)
 
@@ -285,14 +293,14 @@ def discover_qrs_motifs(
         log.warning("Only %d beats — reducing to %d clusters", len(selection), actual_k)
 
     km = KMeans(n_clusters=actual_k, random_state=random_seed, n_init=10, max_iter=300)
-    assignments = km.fit_predict(selected_windows)
-    centroids = km.cluster_centers_
+    assignments = km.fit_predict(selected_windows_norm)
+    centroids = km.cluster_centers_  # in z-score space
 
     cluster_labels = []
     for ci in range(actual_k):
         cluster_mask = assignments == ci
         cluster_beats = selection[cluster_mask]
-        cluster_windows = selected_windows[cluster_mask]
+        cluster_windows = selected_windows_norm[cluster_mask]
 
         n_beats_ci = int(cluster_mask.sum())
         window_ptp = np.ptp(cluster_windows, axis=1)
@@ -327,7 +335,8 @@ def discover_qrs_motifs(
     log.info("QRS clusters: %s", dict(zip(range(actual_k), cluster_labels)))
 
     return {
-        "centroids": centroids.astype(np.float32),
+        "centroids": centroids.astype(np.float32),  # z-score space, used for distance
+        "normalized": True,                          # flag for compute_motif_features
         "cluster_labels": cluster_labels,
         "cluster_assignments": assignments,
         "kmeans_model": km,
@@ -408,9 +417,19 @@ def discover_rr_motifs(
     rr_windows = np.array(windows, dtype=np.float64)
     window_peak_ids = np.array(window_peak_ids)
 
+    # Global z-score normalization — prevents extreme RR outliers (e.g. NaN-filled
+    # zeros, very long pauses) from dominating k-means and creating singleton clusters.
+    # Clip to ±4σ so true outliers don't pull centroids.
+    rr_global_mean = float(np.mean(rr_windows))
+    rr_global_std = float(np.std(rr_windows)) or 1.0
+    rr_windows_norm = np.clip(
+        (rr_windows - rr_global_mean) / rr_global_std, -4.0, 4.0
+    )
+
     log.info(
-        "RR motif discovery: %d windows of size %d, %d clusters",
-        len(rr_windows), window_size, n_clusters,
+        "RR motif discovery: %d windows of size %d, %d clusters "
+        "(global mean=%.1f ms, std=%.1f ms)",
+        len(rr_windows), window_size, n_clusters, rr_global_mean, rr_global_std,
     )
 
     actual_k = min(n_clusters, len(rr_windows))
@@ -418,13 +437,16 @@ def discover_rr_motifs(
         log.warning("Only %d RR windows — reducing to %d clusters", len(rr_windows), actual_k)
 
     km = KMeans(n_clusters=actual_k, random_state=random_seed, n_init=10, max_iter=300)
-    assignments = km.fit_predict(rr_windows)
-    centroids = km.cluster_centers_
+    assignments = km.fit_predict(rr_windows_norm)
+    centroids_norm = km.cluster_centers_
+
+    # De-normalize centroids for labeling and display (ms units)
+    centroids_real = centroids_norm * rr_global_std + rr_global_mean
 
     cluster_labels = []
     for ci in range(actual_k):
         cluster_mask = assignments == ci
-        cluster_windows = rr_windows[cluster_mask]
+        cluster_windows = rr_windows[cluster_mask]  # real ms for stats
         n_wins = int(cluster_mask.sum())
 
         if n_wins == 0:
@@ -436,10 +458,10 @@ def discover_rr_motifs(
         mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 60000.0 / RR_FALLBACK_MS
         cv = std_rr / mean_rr if mean_rr > 0 else 0.0
 
-        centroid = centroids[ci]
+        centroid_real = centroids_real[ci]  # ms — thresholds are in ms
 
         # POTS ramp/recovery detection from RR dynamics.
-        ramp_label = _detect_rr_pattern(centroid)
+        ramp_label = _detect_rr_pattern(centroid_real)
         if ramp_label:
             cluster_labels.append(ramp_label)
             continue
@@ -463,7 +485,10 @@ def discover_rr_motifs(
     log.info("RR clusters: %s", dict(zip(range(actual_k), cluster_labels)))
 
     return {
-        "centroids": centroids.astype(np.float32),
+        "centroids": centroids_norm.astype(np.float32),       # normalized, for distance
+        "centroids_real": centroids_real.astype(np.float32),  # ms, for display
+        "rr_global_mean": rr_global_mean,
+        "rr_global_std": rr_global_std,
         "cluster_labels": cluster_labels,
         "cluster_assignments": assignments,
         "kmeans_model": km,
@@ -513,13 +538,20 @@ def compute_motif_features(
     # ── QRS distances ────────────────────────────────────────────────
     qrs_centroids = qrs_motif_dict["centroids"]
     qrs_labels = qrs_motif_dict["cluster_labels"]
+    qrs_normalized = qrs_motif_dict.get("normalized", False)
 
     # Chunked to avoid (n_beats, n_clusters, window_size) intermediates.
     _DIST_CHUNK = 50_000
     nearest_qrs_idx = np.empty(n, dtype=np.int32)
     nearest_qrs_dist = np.empty(n, dtype=np.float32)
     for _i in range(0, n, _DIST_CHUNK):
-        _b = ecg_windows[_i : _i + _DIST_CHUNK].astype(np.float32)
+        _b = ecg_windows[_i : _i + _DIST_CHUNK].astype(np.float64)
+        if qrs_normalized:
+            # Apply same per-beat z-score normalization used during discovery
+            _bm = _b.mean(axis=1, keepdims=True)
+            _bs = _b.std(axis=1, keepdims=True)
+            _b = (_b - _bm) / (_bs + 1e-8)
+        _b = _b.astype(np.float32)
         _d = np.linalg.norm(_b[:, np.newaxis, :] - qrs_centroids[np.newaxis, :, :], axis=2)
         nearest_qrs_idx[_i : _i + _DIST_CHUNK] = _d.argmin(axis=1)
         nearest_qrs_dist[_i : _i + _DIST_CHUNK] = _d[
@@ -532,6 +564,8 @@ def compute_motif_features(
     rr_window_size = rr_motif_dict["centroids"].shape[1]
     rr_centroids = rr_motif_dict["centroids"]
     rr_labels = rr_motif_dict["cluster_labels"]
+    rr_global_mean = rr_motif_dict.get("rr_global_mean", 0.0)
+    rr_global_std = rr_motif_dict.get("rr_global_std", 1.0)
 
     merged = peaks_df[["peak_id"]].merge(
         labels_df[["peak_id", "rr_prev_ms"]], on="peak_id", how="left",
@@ -546,17 +580,21 @@ def compute_motif_features(
     rr_windows = np.zeros((n, rr_window_size), dtype=np.float64)
     for i in range(n):
         start = i - half_w
-        end = start + rr_window_size
         src_start = max(0, start)
-        src_end = min(n, end)
+        src_end = min(n, start + rr_window_size)
         dst_start = src_start - start
         dst_end = dst_start + (src_end - src_start)
         rr_windows[i, dst_start:dst_end] = rr_filled[src_start:src_end]
 
+    # Apply same global z-score normalization used during discovery
+    rr_windows_norm = np.clip(
+        (rr_windows - rr_global_mean) / (rr_global_std + 1e-8), -4.0, 4.0
+    ).astype(np.float32)
+
     nearest_rr_idx = np.empty(n, dtype=np.int32)
     nearest_rr_dist = np.empty(n, dtype=np.float32)
     for _i in range(0, n, _DIST_CHUNK):
-        _b = rr_windows[_i : _i + _DIST_CHUNK]
+        _b = rr_windows_norm[_i : _i + _DIST_CHUNK]
         _d = np.linalg.norm(_b[:, np.newaxis, :] - rr_centroids[np.newaxis, :, :], axis=2)
         nearest_rr_idx[_i : _i + _DIST_CHUNK] = _d.argmin(axis=1)
         nearest_rr_dist[_i : _i + _DIST_CHUNK] = _d[
@@ -760,9 +798,10 @@ def main() -> None:
             mask = rr_motifs["cluster_assignments"] == ci
             n_wins = int(mask.sum())
             label = rr_motifs["cluster_labels"][ci]
-            centroid = rr_motifs["centroids"][ci]
-            spark = _sparkline(centroid, width=20)
-            mean_rr = float(np.mean(centroid))
+            # Use real-ms centroids for display; normalized centroids for distance only
+            centroid_real = rr_motifs.get("centroids_real", rr_motifs["centroids"])[ci]
+            spark = _sparkline(centroid_real, width=20)
+            mean_rr = float(np.mean(centroid_real))
             mean_hr = 60000.0 / mean_rr if mean_rr > 0 else 0.0
             print(f"  [{ci:2d}] {label:20s}  n={n_wins:5d}  HR≈{mean_hr:.0f} BPM  {spark}")
 
