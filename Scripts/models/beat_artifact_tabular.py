@@ -81,6 +81,15 @@ logger = logging.getLogger("ecgclean.models.beat_artifact_tabular")
 
 # ── Default LightGBM parameters ──────────────────────────────────────────────
 
+# Features computed from existing artifact labels that cause training leakage.
+# They encode the current label distribution directly, so the model learns to
+# regurgitate label counts rather than detect artifacts from beat morphology.
+# Excluded from training; stored feature_columns are kept consistent so
+# prediction never sees them either (both sides of the model see the same set).
+_LABEL_LEAKAGE_FEATURES: frozenset[str] = frozenset({
+    "segment_artifact_fraction",
+})
+
 DEFAULT_LGBM_PARAMS: dict[str, Any] = {
     "objective": "binary",
     "metric": ["binary_logloss", "auc"],
@@ -318,7 +327,15 @@ def train(
     # ── Identify feature columns (before any joins) ───────────────────────
     if features_df.index.name == "peak_id":
         features_df = features_df.reset_index()
-    feature_cols = [c for c in features_df.columns if c != "peak_id"]
+    feature_cols = [
+        c for c in features_df.columns
+        if c != "peak_id" and c not in _LABEL_LEAKAGE_FEATURES
+    ]
+    excluded_leaky = [c for c in features_df.columns if c in _LABEL_LEAKAGE_FEATURES]
+    if excluded_leaky:
+        logger.info(
+            "Excluded label-leakage features from training: %s", excluded_leaky
+        )
     logger.info("Feature columns (%d): %s", len(feature_cols), feature_cols)
 
     # ── Merge: features + labels + peaks + segment quality ────────────────
@@ -379,17 +396,25 @@ def train(
     )
 
     # ── Exclude bad segments ──────────────────────────────────────────────
+    # Only exclude non-artifact beats from bad segments. Unreviewed/clean-
+    # labeled beats in bad segments can't be trusted as negatives. But
+    # artifact-labeled beats in bad segments ARE trustworthy positive examples
+    # and are rare — removing them halves the artifact training count.
     if exclude_bad_segments:
         bad_mask = merged["quality_label"] == "bad"
-        n_bad = int(bad_mask.sum())
+        excl_mask = bad_mask & (merged["target"] == 0)
+        n_bad = int(excl_mask.sum())
         if n_bad > 0:
             n_bad_segments = int(merged.loc[bad_mask, "segment_idx"].nunique())
+            n_artifacts_kept = int((bad_mask & (merged["target"] == 1)).sum())
             logger.info(
-                "Excluding %d beats from %d 'bad' segments",
+                "Excluding %d non-artifact beats from %d 'bad' segments "
+                "(kept %d artifact-labeled beats from those segments)",
                 n_bad,
                 n_bad_segments,
+                n_artifacts_kept,
             )
-            merged = merged[~bad_mask].copy()
+            merged = merged[~excl_mask].copy()
 
     # ── Exclude beats inside bad_region windows ───────────────────────────
     if "in_bad_region" in merged.columns:
