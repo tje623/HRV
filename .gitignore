@@ -24,7 +24,6 @@ zArchive/
 
 # ── Model weights (large binaries, version separately if needed) ─────────────
 Artifact Detector/Models/
-Models/
 *.pt
 *.joblib
 *.pkl
@@ -39,3 +38,6 @@ Scripts/__pycache__/
 Scripts/.DS_Store
 *.log
 *.tmp
+
+# ── Test subsets (symlinks, never commit) ─────────────────────────────────
+Data/Subsets/
