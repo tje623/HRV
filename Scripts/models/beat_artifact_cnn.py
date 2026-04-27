@@ -217,7 +217,7 @@ def _extract_windows(
                 gs["ecg"].values.astype(np.float32),
             )
 
-    sample_interval_ms = int(1000 / SAMPLE_RATE_HZ)  # 8 ms per sample at 125 Hz
+    sample_interval_ms = int(1000 / SAMPLE_RATE_HZ)  # ~7.7 ms per sample at 130 Hz
     half_window = WINDOW_SIZE_SAMPLES // 2
 
     # Window extraction: vectorised per-segment (not per-beat)

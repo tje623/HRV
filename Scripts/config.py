@@ -117,7 +117,6 @@ MARKER_TAGS_JSON        = ANNOTATIONS_MARKERS_DIR / "tags.json"
 MARKER_CSV           = ACCESSORY_DIR / "Marker.csv"
 DEVICE_HR_CSV        = ACCESSORY_DIR / "DeviceHR.csv"
 DEVICE_RR_CSV        = ACCESSORY_DIR / "DeviceRR.csv"
-LOW_AMP_PEAKS_CSV    = ACCESSORY_DIR / "Low-Amplitude Filtered Peaks.csv"
 RSA_EVENTS_CSV       = AUTODETECTED_DIR / "rsa_events.csv"
 VAGAL_ARRESTS_CSV    = AUTODETECTED_DIR / "vagal_arrests.csv"
 
@@ -147,10 +146,16 @@ XL_BASE: str   = "HRV Metrics"
 #  SIGNAL PROCESSING
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SAMPLE_RATE_HZ: int       = 125    # Polar H10 (empirically 8.000 ms/sample)
-WINDOW_SIZE_SAMPLES: int  = 125    # 1-second CNN context window
-QRS_WINDOW_SAMPLES: int   = 63     # 0.5-second QRS morphology window
-PEAK_SNAP_SAMPLES: int    = 8      # +-8 samples = +-64 ms snap tolerance
+SAMPLE_RATE_HZ: int       = 130    # Polar H10 effective ECG sample rate
+
+BEAT_WINDOW_MS: int       = 1000   # 1-second CNN context window
+QRS_WINDOW_MS: int        = 500    # 0.5-second QRS morphology window
+
+# Derived sample counts — always consistent with SAMPLE_RATE_HZ
+WINDOW_SIZE_SAMPLES: int  = int(BEAT_WINDOW_MS / 1000 * SAMPLE_RATE_HZ)   # 130 @ 130 Hz
+QRS_WINDOW_SAMPLES: int   = int(QRS_WINDOW_MS  / 1000 * SAMPLE_RATE_HZ)   #  65 @ 130 Hz
+
+PEAK_SNAP_SAMPLES: int    = 8      # +-8 samples = ~+-62 ms snap tolerance
 
 ECG_BANDPASS_LOW_HZ: float  = 3.0
 ECG_BANDPASS_HIGH_HZ: float = 40.0
@@ -170,30 +175,30 @@ MIN_VALID_TIMESTAMP_MS: int        = 1_577_836_800_000   # 2020-01-01 00:00:00 U
 #  PATIENT PHYSIOLOGY  (POTS — patient-specific)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-HR_BRADY_BPM: float           = 70.0    # bradycardic threshold
-HR_TACHY_BPM: float           = 130.0   # tachycardic threshold (190s are genuine physiology)
-HR_SUSPICIOUS_LOW_BPM: float  = 40.0    # hard flag
-HR_SUSPICIOUS_HIGH_BPM: float = 220.0   # POTS patient regularly hits 186-190+ BPM
-HR_MODAL_LOW_BPM: float       = 90.0    # typical floor
-HR_MODAL_HIGH_BPM: float      = 120.0   # typical ceiling
+HR_BRADY_BPM: float           = 65.0    # bradycardic threshold
+HR_TACHY_BPM: float           = 135.0   # tachycardic threshold (190s are genuine physiology)
+HR_SUSPICIOUS_LOW_BPM: float  = 45.0    # hard flag
+HR_SUSPICIOUS_HIGH_BPM: float = 205.0   # POTS patient regularly hits 186-190+ BPM
+HR_MODAL_LOW_BPM: float       = 85.0    # typical floor
+HR_MODAL_HIGH_BPM: float      = 115.0   # typical ceiling
 
 RR_FALLBACK_MS: float          = 600.0   # median HR ~100 BPM
-RR_SUSPICIOUS_SHORT_MS: float  = 220.0   # ~273 BPM, soft flag
-RR_SUSPICIOUS_LONG_MS: float   = 3200.0  # ~18.75 BPM, soft flag
-RR_SANDWICH_SHORT_MS: float    = 150.0   # spurious-peak sandwich threshold
+RR_SUSPICIOUS_SHORT_MS: float  = 275.0   # ~218 BPM, soft flag
+RR_SUSPICIOUS_LONG_MS: float   = 2250.0  # ~27 BPM, soft flag
+RR_SANDWICH_SHORT_MS: float    = 175.0   # spurious-peak sandwich threshold
 RR_NORMAL_LOW_MS: float        = 300.0   # ~200 BPM upper limit
-RR_NORMAL_HIGH_MS: float       = 1200.0  # ~50 BPM lower limit
+RR_NORMAL_HIGH_MS: float       = 1800.0  # ~33.3 BPM lower limit
 
-POTS_TRANSITION_WINDOW_SEC: float      = 45.0
+POTS_TRANSITION_WINDOW_SEC: float      = 20.0
 POTS_MAX_DELTA_HR_PER_SEC: float       = 25.0
-TACHY_TRANSITION_MIN_RISE_BPM: float   = 35.0
+TACHY_TRANSITION_MIN_RISE_BPM: float   = 40.0
 TACHY_TRANSITION_LOOK_AHEAD_SEC: float = 60.0
 TACHY_TRANSITION_SMOOTH_BEATS: int     = 10
 
 POTS_MIN_FRAC_DECREASING: float  = 0.65
-POTS_MIN_RR_DECLINE_MS: float    = 150.0
+POTS_MIN_RR_DECLINE_MS: float    = 200.0
 POTS_MIN_FRAC_INCREASING: float  = 0.65
-POTS_MIN_RR_RECOVERY_MS: float   = 150.0
+POTS_MIN_RR_RECOVERY_MS: float   = 200.0
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -204,13 +209,13 @@ ARTIFACT_FRACTION_BAD: float   = 0.50   # >50% artifact -> bad segment
 MIN_VALIDATED_BEATS_CLEAN: int = 10     # min clean beats for "clean" segment
 
 # ECG polarity detection
-ECG_INVERSION_THRESHOLD: float  = -0.3  # mV; negative dominant amplitude -> invert
+ECG_INVERSION_THRESHOLD: float  = -100.0  # mV; negative dominant amplitude -> invert
 ECG_INVERSION_WINDOW_SEC: float = 1.0
-ECG_INVERSION_MIN_WINDOWS: int  = 20
+ECG_INVERSION_MIN_WINDOWS: int  = 5.0
 ECG_POLARITY_SAMPLE_STEP: int   = 10    # read 1-in-N rows for file-wide scan
 
 # detect_peaks
-REFRACTORY_MS: int           = 250     # minimum ms between R-peaks
+REFRACTORY_MS: int           = 225     # minimum ms between R-peaks
 MERGE_TOLERANCE_MS: int      = 50      # ensemble detector merge window
 PEAK_CHUNK_MIN: int          = 5       # chunk duration in minutes
 
@@ -258,11 +263,11 @@ LOW_VAR_THRESHOLD: float = 300.0
 LOW_VAR_BEATS: int       = 30
 MS_IN_SECOND: int        = 1000
 
-TIMEFRAMES = ['5M', '15M', '30M', '1H', '2H', '3H', '6H', '12H', '24H']
+TIMEFRAMES = ['5M', '15M', '30M', '1H', '2H', '3H', '4H', '6H', '12H', '24H']
 
 MIN_INT = {
-    '5M': 250, '15M': 750, '30M': 1500, '1H': 3000,
-    '2H': 6500, '3H': 9750, '6H': 24000, '12H': 48000, '24H': 96000,
+    '5M': 250, '15M': 750, '30M': 1500, '1H': 3000, '2H': 6500,
+    '3H': 9750, '4H': 15000, '6H': 24000, '12H': 48000, '24H': 96000,
 }
 
 STATS = {
@@ -276,7 +281,7 @@ BM = {
            'CVSD', 'DC', 'AC', 'SDANN5', 'SDNNI5'],
     'fd': ['Total Power', 'HF', 'HF%', 'HFp', 'LFHF', 'LF', 'LF%', 'LFp',
            'VLF', 'VLF%', 'VLFp', 'ULF'],
-    'nl': ['PermEn', 'SampEn', 'MFE', 'CorrDim', 'DFA \u03b11', 'DFA \u03b12'],
+    'nl': ['PermEn', 'SampEn', 'MFE', 'CorrDim', 'DF𝛼1', 'DF𝛼2'],
     'gm': ['SD1', 'SD2', 'SD1SD2', 'CSI', 'CVI', 'AMo50%', 'HTI', 'TINN'],
 }
 
@@ -284,23 +289,24 @@ BMS = {
     'base': {'Count', 'MedRR', 'MinRR', 'MaxRR', 'MxDMn', 'IQR', 'Q20', 'Q80',
              'MAD', 'MCV', 'SDSD', 'SDNN', 'RMSSD', 'pNN20', 'pNN50', 'CV%',
              'CVSD', 'DC', 'AC', 'HF', 'HF%', 'HFp', 'LF', 'LF%', 'LFp',
-             'LFHF', 'PermEn', 'SampEn', 'DFA \u03b11', 'SD1', 'SD2', 'SD1SD2',
+             'LFHF', 'PermEn', 'SampEn', 'DF𝛼1', 'SD1', 'SD2', 'SD1SD2',
              'CSI', 'CVI'},
-    '\u22641h': {'MFE', 'CorrDim'},
-    '\u22652h': {'VLF', 'VLF%', 'VLFp', 'Total Power', 'DFA \u03b12'},
+    '≤1h': {'MFE', 'CorrDim'},
+    '≥3h': {'VLF', 'VLF%', 'VLFp', 'Total Power', 'DF𝛼2'},
     '24h': {'ULF', 'SDANN5', 'SDNNI5', 'AMo50%', 'HTI', 'TINN'},
 }
 
 TF = {
-    '5M':  BMS['base'] | BMS['\u22641h'],
-    '15M': BMS['base'] | BMS['\u22641h'],
-    '30M': BMS['base'] | BMS['\u22641h'],
-    '1H':  BMS['base'] | BMS['\u22641h'],
-    '2H':  BMS['base'] | BMS['\u22652h'],
-    '3H':  BMS['base'] | BMS['\u22652h'],
-    '6H':  BMS['base'] | BMS['\u22652h'],
-    '12H': BMS['base'] | BMS['\u22652h'],
-    '24H': BMS['base'] | BMS['\u22652h'] | BMS['24h'],
+    '5M':  BMS['base'] | BMS['≤1h'],
+    '15M': BMS['base'] | BMS['≤1h'],
+    '30M': BMS['base'] | BMS['≤1h'],
+    '1H':  BMS['base'] | BMS['≤1h'],
+    '2H':  BMS['base'] | BMS['≤1h'],
+    '3H':  BMS['base'] | BMS['≥3h'],
+    '4H':  BMS['base'] | BMS['≥3h'],
+    '6H':  BMS['base'] | BMS['≥3h'],
+    '12H': BMS['base'] | BMS['≥3h'],
+    '24H': BMS['base'] | BMS['≥3h'] | BMS['24h'],
 }
 
 ENTROPIC_INTERVALS = {
@@ -320,7 +326,7 @@ DECX = {
     'HTI': 0, 'TINN': 0, 'Total Power': 0, 'ULF': 0, 'VLF': 0, 'VLFp': 3,
     'LF': 0, 'LF%': 2, 'LFp': 3, 'HF': 0, 'HF%': 2, 'HFp': 3, 'LFHF': 2,
     'PermEn': 3, 'SampEn': 3, 'MFE': 3, 'CorrDim': 3,
-    'DFA \u03b11': 3, 'DFA \u03b12': 3,
+    'DF𝛼1': 3, 'DF𝛼2': 3,
     'SDANN5': 0, 'SDNNI5': 0, 'SD1': 2, 'SD2': 2, 'SD1SD2': 2,
     'CSI': 2, 'CVI': 2,
 }
@@ -341,13 +347,13 @@ MIN_OVERALL_HRS   = 24
 
 CIR_METRICS       = [['SDNN', 'RMSSD'], ['pNN20', 'LFHF'], ['LF', 'HF']]
 KEY_METRICS       = ['SDNN', 'RMSSD', 'LFHF']
-NONLINEAR_METRICS = ['SD1', 'SD2', 'SD1SD2', 'SampEn', 'DFA \u03b11', 'MFE', 'CorrDim']
+NONLINEAR_METRICS = ['SD1', 'SD2', 'SD1SD2', 'SampEn', 'DF𝛼1', 'MFE', 'CorrDim']
 FREQ_METRICS      = ['ULF', 'VLF', 'LF', 'HF']
 
 CHNG_PT_PENALTY  = 10
 CHNG_PT_COLORS   = ['#ADD8E6', '#FFC0CB']
 HRV3_PLOT_TYPES  = ["Line Plots", "Scatter Plots", "Histograms"]
-HRV3_SHEET_NAMES = ["5M", "15M", "30M", "1H", "2H", "3H", "6H", "12H", "24H"]
+HRV3_SHEET_NAMES = ["5M", "15M", "30M", "1H", "2H", "3H", "4H", "6H", "12H", "24H"]
 
 MPL_RC_PARAMS = {
     'figure.figsize':   (12, 6),

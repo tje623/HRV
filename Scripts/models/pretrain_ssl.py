@@ -131,7 +131,7 @@ def _extract_windows(
     """Extract and bandpass-filter ECG windows (WINDOW_SIZE_SAMPLES samples) for all peaks.
 
     For each peak, a 1-second window centred on the R-peak timestamp is
-    constructed by linear interpolation of the raw ECG samples at 125 Hz.
+    constructed by linear interpolation of the raw ECG samples at 130 Hz.
     If no ECG data is available for a peak's segment, the window is
     all-zeros (zero-padded).
 
@@ -160,7 +160,7 @@ def _extract_windows(
                 gs["ecg"].values.astype(np.float32),
             )
 
-    sample_interval_ms = int(1000 / SAMPLE_RATE_HZ)  # 8 ms per sample at 125 Hz
+    sample_interval_ms = int(1000 / SAMPLE_RATE_HZ)  # ~7.7 ms per sample at 130 Hz
     half_window = WINDOW_SIZE_SAMPLES // 2
 
     n_with_data = 0
@@ -252,7 +252,7 @@ def corrupt_ecg_window(
         window += (np.random.randn(n) * noise_std).astype(np.float32)
 
     elif corruption_type == "masking":
-        mask_len = int(corruption_level * 64)
+        mask_len = int(corruption_level * n)
         if mask_len > 0 and mask_len < n:
             start = np.random.randint(0, max(1, n - mask_len))
             window[start : start + mask_len] = 0.0
@@ -283,7 +283,7 @@ def corrupt_ecg_window(
                 noise_std = reduced_level * 0.3 * sig_std
                 window += (np.random.randn(n) * noise_std).astype(np.float32)
             elif sub_type == "masking":
-                mask_len = int(reduced_level * 64)
+                mask_len = int(reduced_level * n)
                 if mask_len > 0 and mask_len < n:
                     start = np.random.randint(0, max(1, n - mask_len))
                     window[start : start + mask_len] = 0.0

@@ -595,7 +595,7 @@ def _process_one_ecg_file(
     invert = False
     # Window size in sparse-sample space: ECG_INVERSION_WINDOW_SEC of real time
     # spans (_fs_est * ECG_INVERSION_WINDOW_SEC / ECG_POLARITY_SAMPLE_STEP) sparse rows.
-    # At step=10, fs=125: 125/10 = ~12-13 sparse samples per 1-second window.
+    # At step=10, fs=130: 130/10 = ~13 sparse samples per 1-second window.
     _sparse_win = max(3, round(_fs_est * ECG_INVERSION_WINDOW_SEC / ECG_POLARITY_SAMPLE_STEP))
     _nw = len(_s_ecg) // _sparse_win
     logger.info(

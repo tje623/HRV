@@ -34,7 +34,7 @@ import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import PEAK_SNAP_SAMPLES
+from config import PEAK_SNAP_SAMPLES, QRS_WINDOW_SAMPLES
 
 import numpy as np
 import pandas as pd
@@ -414,61 +414,37 @@ def _extract_physio_features(labels_df: pd.DataFrame) -> dict[str, np.ndarray]:
 def _compute_segment_context(
     peaks_df: pd.DataFrame,
     labels_df: pd.DataFrame,
-    segment_quality_preds: pd.DataFrame | None,
 ) -> pd.DataFrame:
     """Compute per-segment aggregate features and return as a join-ready frame.
 
     Segment-level features are broadcast (repeated) to every beat in the
     segment during the final merge.
 
+    Removed (label-leaky / circular):
+      - segment_artifact_fraction: counted beats labeled "artifact" — leaky
+        because unannotated beats default to "clean".
+      - segment_clean_beat_count: counted beats labeled "clean" — same issue.
+      - segment_quality_pred: Stage 0 model output — circular dependency
+        Stage 0 → Stage 1.
+
     Args:
         peaks_df: Sorted peaks table with segment_idx and peak_id.
-        labels_df: Labels table with peak_id, label, rr_prev_ms.
-        segment_quality_preds: Optional Stage 0 predictions with
-            segment_idx and quality_pred columns.
+        labels_df: Labels table with peak_id and rr_prev_ms.
 
     Returns:
-        DataFrame indexed by segment_idx with columns:
-        segment_artifact_fraction, segment_rr_sd,
-        segment_clean_beat_count, segment_quality_pred.
+        DataFrame indexed by segment_idx with column:
+        segment_rr_sd  (signal-only: std of within-segment RR intervals).
     """
-    # Merge labels onto peaks to get segment_idx
     merged = peaks_df[["peak_id", "segment_idx"]].merge(
-        labels_df[["peak_id", "label", "rr_prev_ms"]],
+        labels_df[["peak_id", "rr_prev_ms"]],
         on="peak_id",
         how="left",
     )
 
     seg_groups = merged.groupby("segment_idx")
-
-    artifact_frac = seg_groups.apply(
-        lambda g: (g["label"] == "artifact").sum() / max(len(g), 1),
-        include_groups=False,
-    ).rename("segment_artifact_fraction")
-
     rr_sd = seg_groups["rr_prev_ms"].std().fillna(0.0).rename("segment_rr_sd")
 
-    clean_count = seg_groups.apply(
-        lambda g: (g["label"] == "clean").sum(),
-        include_groups=False,
-    ).rename("segment_clean_beat_count")
-
-    seg_ctx = pd.DataFrame({
-        "segment_artifact_fraction": artifact_frac.astype(np.float32),
-        "segment_rr_sd": rr_sd.astype(np.float32),
-        "segment_clean_beat_count": clean_count.astype(np.int32),
-    })
-
-    # Stage 0 predictions
-    if segment_quality_preds is not None and "quality_pred" in segment_quality_preds.columns:
-        pred_map = segment_quality_preds.set_index("segment_idx")["quality_pred"]
-        seg_ctx["segment_quality_pred"] = (
-            seg_ctx.index.map(pred_map).fillna(-1).astype(np.int32)
-        )
-    else:
-        seg_ctx["segment_quality_pred"] = np.int32(-1)
-
-    return seg_ctx
+    return pd.DataFrame({"segment_rr_sd": rr_sd.astype(np.float32)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -528,8 +504,9 @@ def _compute_signal_quality_features(ecg_windows: np.ndarray) -> dict[str, np.nd
     window_hf_noise_rms = np.sqrt(np.mean(diffs ** 2, axis=1)).astype(np.float32)
 
     # ── Baseline wander slope: OLS via matrix form (no loop, no polyfit) ──
-    xs = np.arange(64, dtype=np.float32)
-    xs_c = xs - xs.mean()                                    # (64,) centred
+    window_len = w.shape[1]
+    xs = np.arange(window_len, dtype=np.float32)
+    xs_c = xs - xs.mean()
     xs_var = float(np.sum(xs_c ** 2))                        # scalar
     w_c = w - w.mean(axis=1, keepdims=True)                  # (n, 64) centred
     if xs_var > 0:
@@ -692,9 +669,7 @@ def compute_beat_feature_matrix(
     feats.update(physio_feats)
 
     # ── Feature group 5: Segment-level context ───────────────────────────
-    seg_ctx = _compute_segment_context(
-        peaks_sorted, labels_sorted, segment_quality_preds
-    )
+    seg_ctx = _compute_segment_context(peaks_sorted, labels_sorted)
 
     # ── Feature group 6: Label-free signal quality ────────────────────────
     sig_quality_feats = _compute_signal_quality_features(windows_sorted)
@@ -710,18 +685,9 @@ def compute_beat_feature_matrix(
         seg_ctx, left_on="segment_idx", right_index=True, how="left"
     )
 
-    # Fill any remaining NaN in segment context columns
-    for col in ("segment_artifact_fraction", "segment_rr_sd"):
-        if col in result.columns:
-            result[col] = result[col].fillna(0.0).astype(np.float32)
-    if "segment_clean_beat_count" in result.columns:
-        result["segment_clean_beat_count"] = (
-            result["segment_clean_beat_count"].fillna(0).astype(np.int32)
-        )
-    if "segment_quality_pred" in result.columns:
-        result["segment_quality_pred"] = (
-            result["segment_quality_pred"].fillna(-1).astype(np.int32)
-        )
+    # Fill any remaining NaN in segment context column
+    if "segment_rr_sd" in result.columns:
+        result["segment_rr_sd"] = result["segment_rr_sd"].fillna(0.0).astype(np.float32)
 
     # Drop helper column, set index
     result.drop(columns=["segment_idx"], inplace=True)
@@ -743,7 +709,7 @@ def compute_beat_feature_matrix(
         "physio_implausible", "pots_transition_candidate", "tachy_transition_candidate",
         "hr_suspicious_low", "hr_suspicious_high",
         "rr_suspicious_short", "rr_suspicious_long",
-        "is_added_peak", "segment_clean_beat_count", "segment_quality_pred",
+        "is_added_peak",
     ]
     for col in int_cols:
         if col in result.columns:
@@ -766,7 +732,7 @@ def compute_beat_feature_matrix(
 def _load_ecg_windows_from_peaks_csv(
     peaks_df: pd.DataFrame,
     ecg_samples_df: pd.DataFrame,
-    window_size: int = 64,
+    window_size: int = QRS_WINDOW_SAMPLES,
 ) -> np.ndarray:
     """Reconstruct ECG windows from ecg_samples for each peak.
 
@@ -777,7 +743,7 @@ def _load_ecg_windows_from_peaks_csv(
     Args:
         peaks_df: Peaks table with timestamp_ms.
         ecg_samples_df: ECG samples table with timestamp_ms and ecg.
-        window_size: Number of ECG samples per window (default 64).
+        window_size: Number of ECG samples per window.
 
     Returns:
         numpy array of shape (n_peaks, window_size), dtype float32.
@@ -1034,8 +1000,31 @@ def main() -> None:
         if sqp.exists():
             seg_quality = pd.read_parquet(sqp)
             logger.info("Loaded segment quality preds from %s", sqp)
+            required_cols = {"segment_idx", "quality_pred"}
+            missing_cols = sorted(required_cols - set(seg_quality.columns))
+            if missing_cols:
+                logger.error(
+                    "--segment-quality-preds is missing required column(s): %s",
+                    missing_cols,
+                )
+                sys.exit(1)
+            pred_counts = (
+                seg_quality["quality_pred"].value_counts(dropna=False).sort_index()
+            )
+            logger.info(
+                "segment_quality_preds coverage: %d rows, %d unique segments, "
+                "quality_pred distribution=%s",
+                len(seg_quality),
+                int(seg_quality["segment_idx"].nunique()),
+                pred_counts.to_dict(),
+            )
         else:
             logger.warning("--segment-quality-preds path not found: %s", sqp)
+    else:
+        logger.warning(
+            "No --segment-quality-preds supplied; segment_quality_pred will be -1 "
+            "for every beat feature row."
+        )
 
     chunk_size = args.chunk_segments
     out_path = Path(args.output) if args.output else proc / "beat_features.parquet"

@@ -6,7 +6,7 @@ Discover recurring ECG waveform patterns (motifs) via k-means clustering
 and compute distance-based anomaly features for each beat.
 
 Two motif families:
-    1. **QRS motifs** — cluster 63-sample (0.5 s @ 125 Hz) beat windows by
+    1. **QRS motifs** — cluster 65-sample (0.5 s @ 130 Hz) beat windows by
        morphology.
     2. **RR motifs**  — cluster sliding windows of 10 consecutive RR intervals.
 

@@ -7,18 +7,30 @@ quality classifier.  Each row corresponds to one 60-second segment and
 carries features from five groups:
 
   1. HRV statistics (meanNN, sdNN, rmssd, pNN50, pNN20, etc.)
-  2. RR roughness (fraction of large RR jumps, artifact/suspicious fractions)
-  3. SQI_QRS (mean inter-beat morphology correlation)
-  4. EMD F-IMF statistics (entropy, mean, variance of first IMF)
-  5. Raw ECG amplitude statistics (median, IQR, p95, saturation fraction)
+     signal-only: derived from inter-beat intervals (timing)
 
-Segments with insufficient data (< 5 beats, < 260 ECG samples) will have
+  2. RR roughness (fraction of large RR jumps, suspicious beat fraction)
+     signal-only: derived from RR timing and physio constraint scores
+     NOTE: artifact_fraction was removed — label-leakage.
+
+  3. SQI_QRS (mean inter-beat morphology correlation among all valid beats)
+     signal-only: uses all non-hard-filtered beats, no label filter.
+     Previously filtered on label=="clean" which was leaky.
+
+  4. Raw ECG amplitude statistics (median, IQR, p95, saturation fraction)
+     signal-only: derived from raw ECG samples
+
+  5. Label-free signal quality (new group)
+     signal-only: segment_zcr, segment_spectral_entropy, segment_qrs_density,
+     segment_flatline_fraction, segment_amplitude_range
+
+Segments with insufficient data (< 5 beats, < 2 ECG samples) will have
 NaN for features that require a minimum sample size.  Specifically:
   - HRV features (group 1): NaN if < 5 non-hard-filtered beats
   - RR roughness (group 2): NaN if < 2 non-hard-filtered beats
-  - SQI_QRS (group 3): NaN if < 2 clean non-hard-filtered beats
-  - EMD features (group 4): NaN if < 260 ECG samples (~2 s @ 130 Hz) or EMD failure
-  - ECG amplitude (group 5): NaN if < 1 ECG sample
+  - SQI_QRS (group 3): NaN if < 2 non-hard-filtered beats
+  - ECG amplitude (group 4): NaN if < 1 ECG sample
+  - Signal quality (group 5): NaN if < 4 ECG samples (welch/zcr minimum)
 
 Downstream code handles imputation — these segments are NOT dropped.
 
@@ -36,12 +48,20 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import SAMPLE_RATE_HZ
+from config import (
+    SAMPLE_RATE_HZ,
+    QRS_WINDOW_SAMPLES,
+    ECG_BANDPASS_LOW_HZ,
+    ECG_BANDPASS_HIGH_HZ,
+    HR_MODAL_LOW_BPM,
+    SEGMENT_DURATION_MS,
+)
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from scipy.signal import butter, sosfilt, welch
 
 # Import shared utility — works both as module and as standalone script
 try:
@@ -66,18 +86,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ecgclean.features.segment_features")
 
-# SAMPLE_RATE_HZ imported from config (Polar H10: empirically 8.000 ms/sample = 125 Hz)
+# SAMPLE_RATE_HZ imported from config (Polar H10 effective ECG sample rate = 130 Hz)
 
 # Minimum thresholds for feature computation
 _MIN_BEATS_HRV: int = 5
 _MIN_BEATS_ROUGHNESS: int = 2
 _MIN_BEATS_SQI: int = 2
-_MIN_ECG_SAMPLES_EMD: int = 250   # ~2 s @ 125 Hz
-_ENTROPY_BINS: int = 100
+_MIN_ECG_SAMPLES_QUALITY: int = 4  # minimum for ZCR / spectral features
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE GROUP 1 — HRV features
+# signal-only: derived from inter-beat timing only
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -138,12 +158,14 @@ def _compute_hrv_features(rr_ms: np.ndarray) -> dict[str, float]:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE GROUP 2 — RR roughness
+# signal-only: RR timing + physio constraint scores (no label dependency)
+# artifact_fraction removed — was derived from beat labels (leaky).
+# suspicious_beat_fraction kept — derived from physio constraint scores.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _compute_rr_roughness(
     rr_ms: np.ndarray,
-    labels: np.ndarray,
     review_scores: np.ndarray,
 ) -> dict[str, float]:
     """Compute RR roughness and beat-quality fractions for a segment.
@@ -151,29 +173,29 @@ def _compute_rr_roughness(
     Roughness measures how "jumpy" the RR sequence is — high roughness
     indicates noise, artifact, or ectopy.
 
+    artifact_fraction was removed (label-leaky: counted beats labeled
+    "artifact", but unannotated beats default to "clean").
+
     Args:
         rr_ms: RR intervals (ms) for all non-hard-filtered beats.
-        labels: Label strings for all beats in the segment.
-        review_scores: Review priority scores for all beats.
+        review_scores: Review priority scores for all beats (physio-derived,
+            not label-derived).
 
     Returns:
-        Dict with roughness fractions and quality-related fractions.
+        Dict with roughness fractions and suspicious beat fraction.
     """
     nan_result = {
-        "rr_roughness_100": np.nan, "rr_roughness_200": np.nan,
-        "rr_roughness_300": np.nan, "artifact_fraction": np.nan,
+        "rr_roughness_100": np.nan,
+        "rr_roughness_200": np.nan,
+        "rr_roughness_300": np.nan,
         "suspicious_beat_fraction": np.nan,
     }
 
     rr = rr_ms[~np.isnan(rr_ms)]
-    n_total = len(labels)
+    n_total = len(review_scores)
 
     if len(rr) < _MIN_BEATS_ROUGHNESS:
-        # Still compute artifact_fraction if we have labels
         if n_total > 0:
-            nan_result["artifact_fraction"] = float(
-                np.sum(labels == "artifact") / n_total
-            )
             nan_result["suspicious_beat_fraction"] = float(
                 np.sum(review_scores > 0) / n_total
             )
@@ -191,9 +213,6 @@ def _compute_rr_roughness(
         rr_roughness_200 = 0.0
         rr_roughness_300 = 0.0
 
-    artifact_fraction = (
-        float(np.sum(labels == "artifact") / n_total) if n_total > 0 else 0.0
-    )
     suspicious_fraction = (
         float(np.sum(review_scores > 0) / n_total) if n_total > 0 else 0.0
     )
@@ -202,47 +221,54 @@ def _compute_rr_roughness(
         "rr_roughness_100": rr_roughness_100,
         "rr_roughness_200": rr_roughness_200,
         "rr_roughness_300": rr_roughness_300,
-        "artifact_fraction": artifact_fraction,
         "suspicious_beat_fraction": suspicious_fraction,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FEATURE GROUP 3 — SQI_QRS
+# signal-only: morphology correlation, NO label filter.
+# Previously filtered on label=="clean" which was leaky because unannotated
+# beats default to "clean".  Now uses ALL non-hard-filtered beats.
+# hard_filtered is structural (impossible timing), not label-derived.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _compute_sqi_qrs(
     windows: np.ndarray,
-    labels: np.ndarray,
     hard_filtered: np.ndarray,
 ) -> float:
     """Compute Signal Quality Index based on QRS morphology consistency.
 
-    SQI_QRS is the mean Pearson correlation between consecutive clean,
-    non-hard-filtered beat windows.  High values (> 0.9) indicate clean
-    signal; low values (< 0.7) suggest noise or artifact.
+    SQI_QRS is the mean Pearson correlation between consecutive non-hard-
+    filtered beat windows.  Uses ALL beats regardless of label — the prior
+    "clean" filter was leaky because unannotated beats default to "clean".
+
+    Hard-filtered beats are still excluded because they represent
+    structurally impossible intervals (e.g., refractory violation), not
+    an annotation judgment.
+
+    High values (> 0.9) indicate clean signal; low values (< 0.7) suggest
+    noise or artifact.
 
     Args:
-        windows: (n_beats, 64) ECG windows for beats in this segment.
-        labels: Label strings for each beat.
-        hard_filtered: Boolean hard-filter flags.
+        windows: (n_beats, QRS_WINDOW_SAMPLES) ECG windows for beats in
+            this segment.
+        hard_filtered: Boolean hard-filter flags (True = structurally
+            impossible, always excluded).
 
     Returns:
-        Mean inter-beat correlation, or NaN if insufficient clean beats.
+        Mean inter-beat correlation, or NaN if insufficient valid beats.
     """
-    clean_mask = (labels == "clean") & (~hard_filtered)
-    clean_idx = np.where(clean_mask)[0]
+    valid_mask = ~hard_filtered
+    valid_idx = np.where(valid_mask)[0]
 
-    if len(clean_idx) < _MIN_BEATS_SQI:
+    if len(valid_idx) < _MIN_BEATS_SQI:
         return np.nan
 
     correlations: list[float] = []
-    for k in range(len(clean_idx) - 1):
-        i, j = clean_idx[k], clean_idx[k + 1]
-        # Only consecutive (adjacent in original order, not necessarily
-        # adjacent indices — we want pairs that are next to each other
-        # in the clean subset)
+    for k in range(len(valid_idx) - 1):
+        i, j = valid_idx[k], valid_idx[k + 1]
         r = pearson_corr_safe(
             windows[i].astype(np.float64),
             windows[j].astype(np.float64),
@@ -256,77 +282,8 @@ def _compute_sqi_qrs(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FEATURE GROUP 4 — EMD F-IMF statistics
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _compute_emd_features(ecg_signal: np.ndarray) -> dict[str, float]:
-    """Apply EMD and compute statistics on the first IMF (F-IMF).
-
-    The first intrinsic mode function captures the highest-frequency
-    component of the ECG.  In clean signal this is dominated by QRS
-    complexes; in noisy signal it captures broadband noise.
-
-    The squared, normalized F-IMF is analysed:
-      - Shannon entropy (from 100-bin histogram)
-      - Mean amplitude
-      - Variance
-
-    Args:
-        ecg_signal: 1-D ECG amplitude array for the segment.
-
-    Returns:
-        Dict with f_imf_entropy, f_imf_mean, f_imf_variance.
-        All NaN if EMD fails or signal too short.
-    """
-    nan_result = {
-        "f_imf_entropy": np.nan,
-        "f_imf_mean": np.nan,
-        "f_imf_variance": np.nan,
-    }
-
-    if len(ecg_signal) < _MIN_ECG_SAMPLES_EMD:
-        return nan_result
-
-    try:
-        from PyEMD import EMD
-        emd = EMD()
-        # Suppress PyEMD warnings about convergence
-        emd.MAX_ITERATION = 100
-        imfs = emd.emd(ecg_signal.astype(np.float64))
-    except Exception as e:
-        logger.debug("EMD failed for segment: %s", e)
-        return nan_result
-
-    if imfs is None or len(imfs) == 0:
-        return nan_result
-
-    # First IMF = highest-frequency component
-    f_imf = imfs[0]
-
-    # Square and normalize
-    f_imf_sq = f_imf ** 2
-    max_abs = np.max(np.abs(f_imf_sq))
-    if max_abs == 0.0:
-        return nan_result
-    f_imf_norm = f_imf_sq / max_abs
-
-    # Shannon entropy via histogram
-    hist, _ = np.histogram(f_imf_norm, bins=_ENTROPY_BINS, density=True)
-    # Avoid log(0) by adding tiny epsilon
-    hist_nonzero = hist[hist > 0]
-    bin_width = 1.0 / _ENTROPY_BINS
-    entropy = -float(np.sum(hist_nonzero * np.log2(hist_nonzero) * bin_width))
-
-    return {
-        "f_imf_entropy": entropy,
-        "f_imf_mean": float(np.mean(f_imf_norm)),
-        "f_imf_variance": float(np.var(f_imf_norm)),
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# FEATURE GROUP 5 — Raw ECG amplitude statistics
+# FEATURE GROUP 4 — Raw ECG amplitude statistics
+# signal-only: raw waveform amplitude features
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -373,6 +330,128 @@ def _compute_ecg_amplitude_features(ecg_signal: np.ndarray) -> dict[str, float]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# FEATURE GROUP 5 — Label-free signal quality (new)
+# signal-only: all five features depend only on the raw ECG waveform and
+# detected peak positions, never on beat labels.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _compute_label_free_quality(
+    ecg_signal: np.ndarray,
+    n_peaks: int,
+) -> dict[str, float]:
+    """Compute label-free segment-level signal quality features.
+
+    These five features diagnose common failure modes (flatline, broadband
+    noise, missing QRS) using only the raw ECG and peak count.
+
+    Features:
+        segment_zcr: Zero-crossing rate of the bandpass-filtered ECG.
+            High (> 0.5) → noise/scribble.  Low (< 0.05) → flatline.
+            Normal QRS signal falls in 0.05–0.35.
+
+        segment_spectral_entropy: Shannon entropy (bits) of the power
+            spectral density.  High → broadband noise.  Low → structured
+            signal with dominant frequency components.
+
+        segment_qrs_density: Detected peaks / expected peaks at
+            HR_MODAL_LOW_BPM (85 BPM).  Value > 1.0 is plausible at higher
+            HR.  Near 0 → detector found almost nothing = bad segment.
+
+        segment_flatline_fraction: Fraction of 1-second windows whose
+            std < max(10 µV, 5% of full-segment std).  Detects sensor-off
+            periods, electrode disconnection, and saturated ADC output.
+
+        segment_amplitude_range: 99th percentile minus 1st percentile of
+            raw ECG amplitude.  Near 0 → flatline/DC.  Very large → motion
+            artifact or saturation.
+
+    Args:
+        ecg_signal: 1-D ECG amplitude array for the segment.
+        n_peaks: Number of detected R-peaks in this segment (from peaks table).
+
+    Returns:
+        Dict with the five feature values, all float.  NaN if the signal is
+        too short (< _MIN_ECG_SAMPLES_QUALITY).
+    """
+    nan_result = {
+        "segment_zcr": np.nan,
+        "segment_spectral_entropy": np.nan,
+        "segment_qrs_density": np.nan,
+        "segment_flatline_fraction": np.nan,
+        "segment_amplitude_range": np.nan,
+    }
+
+    if len(ecg_signal) < _MIN_ECG_SAMPLES_QUALITY:
+        return nan_result
+
+    ecg = ecg_signal.astype(np.float64)
+
+    # ── segment_zcr ───────────────────────────────────────────────────────
+    try:
+        sos = butter(
+            4,
+            [ECG_BANDPASS_LOW_HZ, ECG_BANDPASS_HIGH_HZ],
+            btype="bandpass",
+            fs=SAMPLE_RATE_HZ,
+            output="sos",
+        )
+        filtered = sosfilt(sos, ecg)
+        signs = np.sign(filtered)
+        signs[signs == 0] = 1.0
+        zcr = float(np.mean(np.diff(signs) != 0))
+    except Exception:
+        zcr = np.nan
+
+    # ── segment_spectral_entropy ──────────────────────────────────────────
+    try:
+        nperseg = min(256, len(ecg))
+        _, psd = welch(ecg, fs=SAMPLE_RATE_HZ, nperseg=nperseg)
+        psd_sum = psd.sum()
+        if psd_sum > 0:
+            psd_norm = psd / psd_sum
+            psd_nz = psd_norm[psd_norm > 0]
+            spectral_entropy = float(-np.sum(psd_nz * np.log2(psd_nz)))
+        else:
+            spectral_entropy = 0.0
+    except Exception:
+        spectral_entropy = np.nan
+
+    # ── segment_qrs_density ───────────────────────────────────────────────
+    expected_peaks = (SEGMENT_DURATION_MS / 1000.0) * (HR_MODAL_LOW_BPM / 60.0)
+    qrs_density = float(n_peaks / expected_peaks) if expected_peaks > 0 else np.nan
+
+    # ── segment_flatline_fraction ─────────────────────────────────────────
+    window_samples = SAMPLE_RATE_HZ  # 1-second windows @ 130 Hz
+    n_windows = len(ecg) // window_samples
+    if n_windows == 0:
+        flatline_frac: float = np.nan
+    else:
+        seg_std = float(np.std(ecg)) if len(ecg) > 1 else 0.0
+        threshold = max(10.0, 0.05 * seg_std)
+        flat_count = sum(
+            float(np.std(ecg[i * window_samples:(i + 1) * window_samples])) < threshold
+            for i in range(n_windows)
+        )
+        flatline_frac = float(flat_count) / float(n_windows)
+
+    # ── segment_amplitude_range ───────────────────────────────────────────
+    if len(ecg) >= 2:
+        p1, p99 = np.percentile(ecg, [1, 99])
+        amplitude_range = float(p99 - p1)
+    else:
+        amplitude_range = np.nan
+
+    return {
+        "segment_zcr": zcr,
+        "segment_spectral_entropy": spectral_entropy,
+        "segment_qrs_density": qrs_density,
+        "segment_flatline_fraction": flatline_frac,
+        "segment_amplitude_range": amplitude_range,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -388,21 +467,26 @@ def compute_segment_feature_matrix(
     Iterates over all segments, computes five feature groups per segment,
     and returns a DataFrame indexed by segment_idx.
 
+    Feature contract: all output columns are signal-only (no label leakage).
+    Specifically excluded:
+      - artifact_fraction (was derived from beat labels)
+      - f_imf_entropy/mean/variance (EMD features, dropped)
+
     Features that cannot be computed due to insufficient data are set to NaN.
     The following features may contain NaN:
       - HRV features (group 1): if segment has < 5 non-hard-filtered beats
       - RR roughness (group 2): if segment has < 2 non-hard-filtered beats
-      - sqi_qrs (group 3): if segment has < 2 clean non-hard-filtered beats
-      - EMD features (group 4): if segment has < 260 ECG samples (~2 s @ 130 Hz) or EMD fails
-      - ECG amplitude (group 5): if segment has 0 ECG samples
+      - sqi_qrs (group 3): if segment has < 2 non-hard-filtered beats
+      - ECG amplitude (group 4): if segment has 0 ECG samples
+      - Signal quality (group 5): if segment has < 4 ECG samples
 
     Args:
         peaks_df: Canonical peaks table (peak_id, timestamp_ms, segment_idx).
         labels_df: Enriched labels table (peak_id, label, hard_filtered,
             rr_prev_ms, review_priority_score).
         ecg_samples_df: ECG samples table (timestamp_ms, ecg, segment_idx).
-        ecg_windows: ECG window array (n_beats, 65), aligned to peaks_df
-            row order.
+        ecg_windows: ECG window array (n_beats, QRS_WINDOW_SAMPLES), aligned
+            to peaks_df row order.
 
     Returns:
         DataFrame indexed by segment_idx with all segment feature columns.
@@ -458,38 +542,42 @@ def compute_segment_feature_matrix(
         not_hard = seg_beats[~seg_beats["hard_filtered"]]
 
         rr_ms = not_hard["rr_prev_ms"].values.astype(np.float64)
-        all_labels = seg_beats["label"].values.astype(str)
         all_scores = seg_beats["review_priority_score"].values.astype(np.float64)
         hard_flags = seg_beats["hard_filtered"].values.astype(bool)
 
         # ── Beat windows for this segment ─────────────────────────────────
         beat_rows = seg_beats["_peak_row"].values.astype(int)
-        seg_windows = ecg_windows[beat_rows] if len(beat_rows) > 0 else np.empty((0, 65))
+        seg_windows = (
+            ecg_windows[beat_rows]
+            if len(beat_rows) > 0
+            else np.empty((0, QRS_WINDOW_SAMPLES))
+        )
 
         # ── Feature group 1: HRV ──────────────────────────────────────────
         hrv = _compute_hrv_features(rr_ms)
         row.update(hrv)
 
-        # ── Feature group 2: RR roughness ─────────────────────────────────
-        roughness = _compute_rr_roughness(rr_ms, all_labels, all_scores)
+        # ── Feature group 2: RR roughness (signal-only, no labels) ───────
+        roughness = _compute_rr_roughness(rr_ms, all_scores)
         row.update(roughness)
 
-        # ── Feature group 3: SQI_QRS ──────────────────────────────────────
-        row["sqi_qrs"] = _compute_sqi_qrs(seg_windows, all_labels, hard_flags)
+        # ── Feature group 3: SQI_QRS (all non-hard-filtered beats) ───────
+        row["sqi_qrs"] = _compute_sqi_qrs(seg_windows, hard_flags)
 
-        # ── Feature group 4: EMD F-IMF ────────────────────────────────────
+        # ── ECG signal for groups 4 & 5 ───────────────────────────────────
         if seg_idx in ecg_by_seg.groups:
             ecg_seg = ecg_by_seg.get_group(seg_idx)
             ecg_signal = ecg_seg["ecg"].values.astype(np.float64)
         else:
             ecg_signal = np.array([], dtype=np.float64)
 
-        emd_feats = _compute_emd_features(ecg_signal)
-        row.update(emd_feats)
-
-        # ── Feature group 5: ECG amplitude ────────────────────────────────
+        # ── Feature group 4: ECG amplitude (signal-only) ──────────────────
         amp_feats = _compute_ecg_amplitude_features(ecg_signal)
         row.update(amp_feats)
+
+        # ── Feature group 5: Label-free signal quality (new) ─────────────
+        quality_feats = _compute_label_free_quality(ecg_signal, len(seg_beats))
+        row.update(quality_feats)
 
         records.append(row)
 
@@ -521,7 +609,7 @@ def compute_segment_feature_matrix(
 def _load_ecg_windows(
     peaks_df: pd.DataFrame,
     ecg_samples_df: pd.DataFrame,
-    window_size: int = 65,
+    window_size: int = QRS_WINDOW_SAMPLES,
 ) -> np.ndarray:
     """Reconstruct ECG windows from ecg_samples for each peak.
 
@@ -531,7 +619,8 @@ def _load_ecg_windows(
     Args:
         peaks_df: Peaks table with timestamp_ms.
         ecg_samples_df: ECG samples table with timestamp_ms and ecg.
-        window_size: Number of ECG samples per window (default 65 = 0.5 s @ 130 Hz).
+        window_size: Number of ECG samples per window
+            (default QRS_WINDOW_SAMPLES = 0.5 s @ 130 Hz).
 
     Returns:
         numpy array of shape (n_peaks, window_size), dtype float32.

@@ -32,7 +32,7 @@ Usage
     python ecgclean/detect_peaks.py \\
         --ecg-dir path/to/raw_ecg/ \\
         --output-dir path/to/peaks/ \\
-        [--fs 125] \\
+        [--fs 130] \\
         [--method ensemble|ptompkins|swt] \\
         [--chunk-min 5] \\
         [--refractory-ms 250] \\
@@ -143,7 +143,7 @@ def detect_swt(ecg: np.ndarray, fs: float, refractory_ms: float = 250.0) -> np.n
     """SWT-based R-peak detector.
 
     Uses levels 2 and 3 of a Stationary Wavelet Transform (db4 wavelet).
-    At 125 Hz these levels capture ~8–31 Hz — the core QRS energy band.
+    At 130 Hz these levels capture ~8–32 Hz — the core QRS energy band.
     Detail coefficients are squared and summed to form an energy envelope.
 
     Returns sample indices of detected R-peaks.
@@ -156,7 +156,7 @@ def detect_swt(ecg: np.ndarray, fs: float, refractory_ms: float = 250.0) -> np.n
     padded = np.pad(_bandpass(ecg, fs), (0, pad_len - orig_len), mode="edge")
 
     # coeffs[i] = (cA_level_i+1, cD_level_i+1)  for i in 0..level-1
-    # At 125 Hz: level 2 detail (D2) ≈ 15.6–31.25 Hz, level 3 detail (D3) ≈ 7.8–15.6 Hz
+    # At 130 Hz: level 2 detail (D2) ≈ 16.25–32.5 Hz, level 3 detail (D3) ≈ 8.1–16.25 Hz
     # This covers the core QRS band of ~8-31 Hz
     coeffs = pywt.swt(padded, "db4", level=level)
     cD2 = coeffs[2][1][:orig_len]
@@ -367,7 +367,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, required=True,
                    help="Directory to write peak CSV files")
     p.add_argument("--fs", type=float, default=SAMPLE_RATE_HZ,
-                   help="Sampling rate Hz (default: 125 for Polar H10 — do NOT use 130 or 256)")
+                   help="Sampling rate Hz (default: 130 for Polar H10)")
     p.add_argument("--method", choices=["ensemble", "ptompkins", "swt"],
                    default="ensemble",
                    help="Detection method (default: ensemble)")

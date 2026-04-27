@@ -33,11 +33,6 @@ run_if_missing "$OUT/ecg_samples.parquet" \
 run_if_missing "$OUT/physio_constraints_done.flag" \
   bash -c "python ecgclean/physio_constraints.py --processed-dir \"$OUT\" && touch \"$OUT/physio_constraints_done.flag\""
 
-run_if_missing "$OUT/beat_features.parquet" \
-  python ecgclean/features/beat_features.py \
-    --processed-dir "$OUT" \
-    --output "$OUT/beat_features.parquet"
-
 run_if_missing "$OUT/segment_features.parquet" \
   python ecgclean/features/segment_features.py \
     --processed-dir "$OUT" \
@@ -48,6 +43,12 @@ run_if_missing "$OUT/segment_quality_preds.parquet" \
     --segment-features "$OUT/segment_features.parquet" \
     --model models/segment_quality_v1.joblib \
     --output "$OUT/segment_quality_preds.parquet"
+
+run_if_missing "$OUT/beat_features.parquet" \
+  python ecgclean/features/beat_features.py \
+    --processed-dir "$OUT" \
+    --segment-quality-preds "$OUT/segment_quality_preds.parquet" \
+    --output "$OUT/beat_features.parquet"
 
 run_if_missing "$OUT/beat_tabular_preds.parquet" \
   python ecgclean/models/beat_artifact_tabular.py predict \

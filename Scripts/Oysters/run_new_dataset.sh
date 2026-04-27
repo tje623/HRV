@@ -73,14 +73,8 @@ echo "[3/10] Applying physio constraints..."
 python ecgclean/physio_constraints.py \
   --processed-dir "$NEW_PROC/"
 
-# ── Stage 4: Beat features ────────────────────────────────────────────────────
-echo "[4/10] Extracting beat features..."
-python ecgclean/features/beat_features.py \
-  --processed-dir "$NEW_PROC/" \
-  --output "$NEW_PROC/beat_features.parquet"
-
-# ── Stage 5: Segment features + quality ───────────────────────────────────────
-echo "[5/10] Extracting segment features..."
+# ── Stage 4: Segment features + quality ───────────────────────────────────────
+echo "[4/10] Extracting segment features..."
 python ecgclean/features/segment_features.py \
   --processed-dir "$NEW_PROC/" \
   --output "$NEW_PROC/segment_features.parquet"
@@ -89,6 +83,13 @@ python ecgclean/models/segment_quality.py predict \
   --segment-features "$NEW_PROC/segment_features.parquet" \
   --model models/segment_quality_v1.joblib \
   --output "$NEW_PROC/segment_quality_preds.parquet"
+
+# ── Stage 5: Beat features ────────────────────────────────────────────────────
+echo "[5/10] Extracting beat features..."
+python ecgclean/features/beat_features.py \
+  --processed-dir "$NEW_PROC/" \
+  --segment-quality-preds "$NEW_PROC/segment_quality_preds.parquet" \
+  --output "$NEW_PROC/beat_features.parquet"
 
 # ── Stage 6: Global template correlation ──────────────────────────────────────
 echo "[6/10] Computing global template correlations..."
