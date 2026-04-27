@@ -35,6 +35,8 @@ ECG_DIR=""
 PEAKS_DIR=""
 ANNOTATIONS="${ROOT}/Data/Annotations/V1/V1.json"
 MAX_FILES=""
+SEG_QUALITY_MODEL=""
+BEAT_MODEL_OVERRIDE=""
 
 # ── Parse arguments ────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -45,6 +47,8 @@ while [[ $# -gt 0 ]]; do
         --peaks-dir)     PEAKS_DIR="$2";      shift 2 ;;
         --annotations)   ANNOTATIONS="$2";    shift 2 ;;
         --max-files)     MAX_FILES="$2";      shift 2 ;;
+        --segment-quality-model) SEG_QUALITY_MODEL="$2"; shift 2 ;;
+        --beat-model)            BEAT_MODEL_OVERRIDE="$2"; shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -57,6 +61,21 @@ if [ -n "$SUBSET_NAME" ]; then
     [ -z "$PROCESSED_DIR" ] && PROCESSED_DIR="${SUBSET_BASE}/Processed"
 fi
 
+# If ECG_DIR / PEAKS_DIR not given but PROCESSED_DIR is, read defaults from config.py
+if [ -n "$PROCESSED_DIR" ] && [ -z "$ECG_DIR" ]; then
+    ECG_DIR="$(python - "${ROOT}" <<'PYEOF'
+import sys; sys.path.insert(0, sys.argv[1]+"/Scripts")
+from config import ECG_DIR as D; print(D)
+PYEOF
+    )"
+fi
+if [ -n "$PROCESSED_DIR" ] && [ -z "$PEAKS_DIR" ]; then
+    PEAKS_DIR="$(python - "${ROOT}" <<'PYEOF'
+import sys; sys.path.insert(0, sys.argv[1]+"/Scripts")
+from config import PEAKS_DIR as D; print(D)
+PYEOF
+    )"
+fi
 if [ -z "$PROCESSED_DIR" ] || [ -z "$ECG_DIR" ] || [ -z "$PEAKS_DIR" ]; then
     echo "ERROR: Provide --subset <name> or all of --ecg-dir / --peaks-dir / --processed-dir"
     exit 1
@@ -212,7 +231,7 @@ fi
 
 # ── Step 5: segment_quality_predict ───────────────────────────────────────────
 SEG_QUAL="${PROCESSED_DIR}/segment_quality_preds.parquet"
-SEG_MODEL="${ROOT}/Models/segment_quality_v1.joblib"
+SEG_MODEL="${SEG_QUALITY_MODEL:-${ROOT}/Models/segment_quality_v1.joblib}"
 if ! run_step "segment_quality_predict" \
     python "${ROOT}/Scripts/models/segment_quality.py" predict \
         --segment-features "$SEG_FEAT" \
@@ -247,7 +266,7 @@ fi
 
 # ── Step 8: beat_tabular_predict ──────────────────────────────────────────────
 BEAT_PREDS="${PROCESSED_DIR}/beat_tabular_preds.parquet"
-BEAT_MODEL="${ROOT}/Models/beat_tabular_v1.joblib"
+BEAT_MODEL="${BEAT_MODEL_OVERRIDE:-${ROOT}/Models/beat_tabular_v1.joblib}"
 run_step "beat_tabular_predict" \
     python "${ROOT}/Scripts/models/beat_artifact_tabular.py" predict \
         --beat-features "$BEAT_FEAT" \

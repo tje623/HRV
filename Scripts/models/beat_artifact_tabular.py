@@ -939,8 +939,9 @@ def predict(
 
     result = pd.DataFrame(
         {
-            "peak_id": peak_ids,
+            "peak_id":            peak_ids,
             "p_artifact_tabular": proba,
+            "p_artifact":         proba,        # alias required by downstream spec
             "predicted_artifact": predicted,
         }
     )
@@ -1082,6 +1083,7 @@ def _cli_predict(args: argparse.Namespace) -> None:
     out_schema = pa.schema([
         pa.field("peak_id",             pa.int64()),
         pa.field("p_artifact_tabular",  pa.float32()),
+        pa.field("p_artifact",          pa.float32()),
         pa.field("predicted_artifact",  pa.bool_()),
         pa.field("uncertainty_tabular", pa.float32()),
     ])
@@ -1146,6 +1148,7 @@ def _cli_predict(args: argparse.Namespace) -> None:
                     {
                         "peak_id":             peak_ids,
                         "p_artifact_tabular":  proba,
+                        "p_artifact":          proba,        # alias required by downstream spec
                         "predicted_artifact":  predicted,
                         "uncertainty_tabular": uncertainty,
                     },
