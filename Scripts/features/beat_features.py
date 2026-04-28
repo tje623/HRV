@@ -8,10 +8,18 @@ in peaks.parquet and carries features from five groups:
 
   1. Legacy v6 features (RR stats + ECG window stats)
   2. Extended RR context (wider neighbourhood, local stats)
-  3. QRS morphology similarity (template correlation)
+  3. QRS morphology similarity (adjacent-beat correlation only)
   4. Physio constraint pass-through (flags from Step 2)
   5. Segment-level context (broadcast per segment)
   6. Label-free signal quality (raw waveform statistics, immune to label contamination)
+
+NOTE — Group 3 no longer includes a template-correlation feature.
+The per-segment template (qrs_corr_to_template) was removed because it
+was built from beats where label=="clean", and unannotated beats default
+to "clean", creating label leakage.  The replacement global template
+correlation (global_corr_clean) is produced separately by
+Scripts/features/global_templates.py (reviewed=True AND label=="clean"
+filter) and joined onto beat_features.parquet before Stage 1 training.
 
 All output columns are float32 or int32 — no object dtypes, no NaN.
 
@@ -67,9 +75,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("ecgclean.features.beat_features")
-
-# Minimum clean beats per segment for a usable local QRS template
-_MIN_TEMPLATE_BEATS: int = 3
 
 # Fork-shared globals dict for multiprocessing workers
 
@@ -254,89 +259,30 @@ def _compute_extended_rr(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _build_segment_templates(
-    ecg_windows: np.ndarray,
-    segment_ids: np.ndarray,
-    labels: np.ndarray,
-    hard_filtered: np.ndarray,
-) -> tuple[dict[int, np.ndarray], np.ndarray]:
-    """Build per-segment clean QRS templates and a global fallback template.
-
-    For each segment, the template is the mean of all 64-sample windows
-    belonging to clean, non-hard-filtered beats.  Segments with fewer
-    than ``_MIN_TEMPLATE_BEATS`` clean beats use the global mean template.
-
-    Args:
-        ecg_windows: (n, 64) array of beat ECG windows.
-        segment_ids: (n,) array of segment indices per beat.
-        labels: (n,) array of label strings per beat.
-        hard_filtered: (n,) boolean array of hard-filter status.
-
-    Returns:
-        Tuple of (segment_template_dict, global_template).
-        segment_template_dict maps segment_idx → (64,) float64 array.
-        global_template is the (64,) float64 fallback.
-    """
-    clean_mask = (labels == "clean") & (~hard_filtered)
-    clean_windows = ecg_windows[clean_mask]
-
-    # Global fallback template
-    if len(clean_windows) >= 1:
-        global_template = np.mean(clean_windows.astype(np.float64), axis=0)
-    else:
-        # Absolute fallback: mean of all windows
-        global_template = np.mean(ecg_windows.astype(np.float64), axis=0)
-
-    # Per-segment templates
-    unique_segs = np.unique(segment_ids)
-    seg_templates: dict[int, np.ndarray] = {}
-    for seg_idx in unique_segs:
-        seg_clean = clean_mask & (segment_ids == seg_idx)
-        n_clean = int(seg_clean.sum())
-        if n_clean >= _MIN_TEMPLATE_BEATS:
-            seg_templates[int(seg_idx)] = np.mean(
-                ecg_windows[seg_clean].astype(np.float64), axis=0
-            )
-        else:
-            seg_templates[int(seg_idx)] = global_template
-
-    return seg_templates, global_template
-
-
-def _compute_qrs_similarity(
-    ecg_windows: np.ndarray,
-    segment_ids: np.ndarray,
-    labels: np.ndarray,
-    hard_filtered: np.ndarray,
-) -> dict[str, np.ndarray]:
+def _compute_qrs_similarity(ecg_windows: np.ndarray) -> dict[str, np.ndarray]:
     """Compute QRS morphology similarity features for every beat.
 
-    Features:
-        - qrs_corr_to_template: correlation with segment-local clean template
-        - qrs_corr_prev: correlation with previous beat's window
-        - qrs_corr_next: correlation with next beat's window
+    Only adjacent-beat correlations are computed here.  Template correlation
+    (global_corr_clean) is produced separately by global_templates.py using
+    a label-contamination-safe global template (reviewed=True AND
+    label=="clean") and joined onto beat_features.parquet before training.
+
+    The removed feature ``qrs_corr_to_template`` used a per-segment template
+    built from beats where label=="clean".  Because unannotated beats default
+    to "clean", this introduced label leakage and dominated Stage 1 feature
+    importance.
+
+    Features produced:
+        - qrs_corr_prev: Pearson correlation with the previous beat's window
+        - qrs_corr_next: Pearson correlation with the next beat's window
 
     Args:
-        ecg_windows: (n, 64) array of beat ECG windows.
-        segment_ids: (n,) array of segment indices.
-        labels: (n,) array of label strings.
-        hard_filtered: (n,) boolean array.
+        ecg_windows: (n, window_size) array of beat ECG windows.
 
     Returns:
         Dict of feature-name → float32 array.
     """
     n = len(ecg_windows)
-    seg_templates, global_template = _build_segment_templates(
-        ecg_windows, segment_ids, labels, hard_filtered
-    )
-
-    # Build per-beat template array (vectorised lookup)
-    template_arr = np.stack(
-        [seg_templates.get(int(s), global_template) for s in segment_ids]
-    ).astype(np.float32)
-
-    qrs_corr_template = _pearson_batch(ecg_windows.astype(np.float32), template_arr)
-
     qrs_corr_prev = np.zeros(n, dtype=np.float32)
     qrs_corr_next = np.zeros(n, dtype=np.float32)
 
@@ -351,7 +297,6 @@ def _compute_qrs_similarity(
         )
 
     return {
-        "qrs_corr_to_template": qrs_corr_template,
         "qrs_corr_prev": qrs_corr_prev,
         "qrs_corr_next": qrs_corr_next,
     }
@@ -650,15 +595,9 @@ def compute_beat_feature_matrix(
     feats.update(ext_rr)
 
     # ── Feature group 3: QRS morphology similarity ───────────────────────
-    label_vals = labels_sorted["label"].values.astype(str)
-    hard_filt = (
-        labels_sorted["hard_filtered"].values.astype(bool)
-        if "hard_filtered" in labels_sorted.columns
-        else np.zeros(n, dtype=bool)
-    )
-    qrs_feats = _compute_qrs_similarity(
-        windows_sorted, segment_ids, label_vals, hard_filt
-    )
+    # global_corr_clean (template correlation) is produced separately by
+    # global_templates.py and joined on peak_id before Stage 1 training.
+    qrs_feats = _compute_qrs_similarity(windows_sorted)
     feats.update(qrs_feats)
 
     # ── Feature group 4: Physio constraint pass-through ──────────────────

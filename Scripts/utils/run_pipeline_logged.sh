@@ -252,6 +252,30 @@ if ! run_step "beat_features" \
     exit "$OVERALL_EXIT"
 fi
 
+# ── Step 6b: global_templates build ──────────────────────────────────────────
+GLOBAL_TMPL="${PROCESSED_DIR}/global_template.joblib"
+if ! run_step "global_templates_build" \
+    python "${ROOT}/Scripts/features/global_templates.py" build \
+        --peaks      "${PROCESSED_DIR}/peaks.parquet" \
+        --labels     "${PROCESSED_DIR}/labels.parquet" \
+        --ecg-samples "${PROCESSED_DIR}/ecg_samples.parquet" \
+        --output     "$GLOBAL_TMPL"; then
+    write_summary "$RUN_LOG_DIR" "$OVERALL_EXIT"
+    exit "$OVERALL_EXIT"
+fi
+
+# ── Step 6c: global_templates correlate ──────────────────────────────────────
+GLOBAL_TMPL_FEAT="${PROCESSED_DIR}/global_template_features.parquet"
+if ! run_step "global_templates_correlate" \
+    python "${ROOT}/Scripts/features/global_templates.py" correlate \
+        --templates  "$GLOBAL_TMPL" \
+        --peaks      "${PROCESSED_DIR}/peaks.parquet" \
+        --ecg-samples "${PROCESSED_DIR}/ecg_samples.parquet" \
+        --output     "$GLOBAL_TMPL_FEAT"; then
+    write_summary "$RUN_LOG_DIR" "$OVERALL_EXIT"
+    exit "$OVERALL_EXIT"
+fi
+
 # ── Step 7: beat_tabular_train ────────────────────────────────────────────────
 BEAT_MODEL_OUT="${PROCESSED_DIR}/beat_tabular_trained.joblib"
 if ! run_step "beat_tabular_train" \
@@ -259,6 +283,7 @@ if ! run_step "beat_tabular_train" \
         --beat-features "$BEAT_FEAT" \
         --labels "${PROCESSED_DIR}/labels.parquet" \
         --segment-quality-preds "$SEG_QUAL" \
+        --global-template-features "$GLOBAL_TMPL_FEAT" \
         --output "$BEAT_MODEL_OUT"; then
     write_summary "$RUN_LOG_DIR" "$OVERALL_EXIT"
     exit "$OVERALL_EXIT"
@@ -270,6 +295,7 @@ BEAT_MODEL="${BEAT_MODEL_OVERRIDE:-${ROOT}/Models/beat_tabular_v1.joblib}"
 run_step "beat_tabular_predict" \
     python "${ROOT}/Scripts/models/beat_artifact_tabular.py" predict \
         --beat-features "$BEAT_FEAT" \
+        --global-template-features "$GLOBAL_TMPL_FEAT" \
         --model "$BEAT_MODEL" \
         --output "$BEAT_PREDS" || true
 

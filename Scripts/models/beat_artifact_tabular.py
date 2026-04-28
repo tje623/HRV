@@ -245,6 +245,7 @@ def train(
     val_fraction: float = 0.2,
     exclude_bad_segments: bool = True,
     random_seed: int = 42,
+    global_template_features_path: str | None = None,
 ) -> dict:
     """Train a LightGBM binary classifier for beat-level artifact detection.
 
@@ -271,6 +272,12 @@ def train(
         exclude_bad_segments: If True, drop all beats from segments
             predicted ``bad`` by the Stage 0 classifier.  Default True.
         random_seed: Random seed for LightGBM reproducibility.
+        global_template_features_path: Optional path to
+            ``global_template_features.parquet`` produced by
+            ``global_templates.py correlate``.  When provided, the
+            ``global_corr_clean`` column is left-joined on ``peak_id``
+            before feature columns are identified, so the model trains
+            with the label-contamination-safe template correlation.
 
     Returns:
         Dict containing validation metrics: PR-AUC, ROC-AUC, per-threshold
@@ -315,6 +322,40 @@ def train(
         len(seg_preds_df),
         len(peaks_df),
     )
+
+    # ── Optionally join global template features ──────────────────────────
+    # global_template_features.parquet is produced by global_templates.py
+    # correlate and contains (peak_id, global_corr_clean).  This is a
+    # label-contamination-safe template correlation (built from
+    # reviewed=True AND label=="clean" beats dataset-wide) and must be
+    # joined here — before feature_cols is identified — so the model sees
+    # it as a regular feature.
+    if global_template_features_path is not None:
+        gtf_path = Path(global_template_features_path)
+        if not gtf_path.exists():
+            raise FileNotFoundError(
+                f"Global template features not found: {gtf_path}"
+            )
+        gtf_df = pd.read_parquet(gtf_path)
+        if gtf_df.index.name == "peak_id":
+            gtf_df = gtf_df.reset_index()
+        if features_df.index.name == "peak_id":
+            features_df = features_df.reset_index()
+        # Left-join so beats with no template coverage get 0.0 (imputed later)
+        features_df = features_df.merge(
+            gtf_df[["peak_id", "global_corr_clean"]],
+            on="peak_id",
+            how="left",
+        )
+        features_df["global_corr_clean"] = (
+            features_df["global_corr_clean"].fillna(0.0)
+        )
+        logger.info(
+            "Joined global_template_features: global_corr_clean added "
+            "(non-null: %d / %d)",
+            features_df["global_corr_clean"].notna().sum(),
+            len(features_df),
+        )
 
     # ── Identify feature columns (before any joins) ───────────────────────
     if features_df.index.name == "peak_id":
@@ -1006,6 +1047,7 @@ def _cli_train(args: argparse.Namespace) -> None:
         val_fraction=args.val_fraction,
         exclude_bad_segments=not args.no_exclude_bad_segments,
         random_seed=args.seed,
+        global_template_features_path=getattr(args, "global_template_features", None),
     )
 
 
@@ -1048,23 +1090,53 @@ def _cli_predict(args: argparse.Namespace) -> None:
         threshold,
     )
 
+    # ── Optionally load global template features (join per-batch) ─────────
+    # global_template_features.parquet is small (~58M rows × 2 cols ≈ 1 GB)
+    # and is loaded entirely into RAM once so each streaming batch can be
+    # joined cheaply on peak_id.
+    gtf_df: pd.DataFrame | None = None
+    if getattr(args, "global_template_features", None):
+        gtf_path = Path(args.global_template_features)
+        if not gtf_path.exists():
+            logger.error("Global template features not found: %s", gtf_path)
+            sys.exit(1)
+        gtf_df = pd.read_parquet(gtf_path)
+        if gtf_df.index.name == "peak_id":
+            gtf_df = gtf_df.reset_index()
+        # Keep only what we need to minimise memory
+        gtf_df = gtf_df[["peak_id", "global_corr_clean"]].copy()
+        logger.info(
+            "Loaded global_template_features: %d rows", len(gtf_df)
+        )
+
     # ── Inspect parquet schema without loading data ────────────────────────
     pf = pq.ParquetFile(bf_path)
     schema_names = set(pf.schema_arrow.names)
     n_total_rows = pf.metadata.num_rows
 
-    missing_cols = [c for c in feature_cols if c not in schema_names]
+    # Feature columns that must come from beat_features.parquet itself
+    # (global_corr_clean is joined separately if gtf_df is provided)
+    beat_feature_cols = [
+        c for c in feature_cols if c != "global_corr_clean"
+    ]
+    missing_cols = [c for c in beat_feature_cols if c not in schema_names]
     if missing_cols:
         raise ValueError(
             f"Feature mismatch: model expects {missing_cols} which are "
             f"missing from {bf_path}.  Model was trained at {trained_at} "
             f"with features: {feature_cols}"
         )
+    if "global_corr_clean" in feature_cols and gtf_df is None:
+        raise ValueError(
+            "Model was trained with global_corr_clean but "
+            "--global-template-features was not provided.  Pass "
+            "--global-template-features <path> to predict."
+        )
 
-    # Only request the columns we actually need (peak_id + feature_cols)
+    # Only request the columns we actually need (peak_id + beat_feature_cols)
     cols_to_read = list(
         dict.fromkeys(  # preserves order, deduplicates
-            (["peak_id"] if "peak_id" in schema_names else []) + feature_cols
+            (["peak_id"] if "peak_id" in schema_names else []) + beat_feature_cols
         )
     )
 
@@ -1120,6 +1192,15 @@ def _cli_predict(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             peak_ids = df["peak_id"].values.astype(np.int64)
+
+            # Join global template features if provided
+            if gtf_df is not None:
+                df = df.merge(
+                    gtf_df,
+                    on="peak_id",
+                    how="left",
+                )
+                df["global_corr_clean"] = df["global_corr_clean"].fillna(0.0)
 
             # Impute NaNs with training medians then predict
             X = _apply_median_imputation(df[feature_cols], train_medians)
@@ -1251,6 +1332,17 @@ def main() -> None:
         default=LGBM_RANDOM_STATE,
         help=f"Random seed for LightGBM (default: {LGBM_RANDOM_STATE})",
     )
+    train_parser.add_argument(
+        "--global-template-features",
+        type=str,
+        default=None,
+        dest="global_template_features",
+        help=(
+            "Path to global_template_features.parquet produced by "
+            "global_templates.py correlate.  When provided, "
+            "global_corr_clean is joined on peak_id before training."
+        ),
+    )
 
     # ── predict ───────────────────────────────────────────────────────────
     predict_parser = subparsers.add_parser(
@@ -1287,6 +1379,17 @@ def main() -> None:
         help=(
             f"Rows per streaming batch (default: {BEAT_BATCH_SIZE}). "
             "Decrease if RAM is tight."
+        ),
+    )
+    predict_parser.add_argument(
+        "--global-template-features",
+        type=str,
+        default=None,
+        dest="global_template_features",
+        help=(
+            "Path to global_template_features.parquet produced by "
+            "global_templates.py correlate.  Required when the model was "
+            "trained with global_corr_clean."
         ),
     )
 

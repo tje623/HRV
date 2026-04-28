@@ -362,9 +362,11 @@ def _compute_label_free_quality(
             std < max(10 µV, 5% of full-segment std).  Detects sensor-off
             periods, electrode disconnection, and saturated ADC output.
 
-        segment_amplitude_range: 99th percentile minus 1st percentile of
-            raw ECG amplitude.  Near 0 → flatline/DC.  Very large → motion
-            artifact or saturation.
+        segment_amplitude_range: 95th percentile minus 5th percentile of
+            raw ECG amplitude (trimmed range).  Using p95−p5 rather than
+            p99−p1 to be robust against ADC saturation spikes that dominate
+            the extreme tails.  Near 0 → flatline/DC.  Very large → motion
+            artifact.
 
     Args:
         ecg_signal: 1-D ECG amplitude array for the segment.
@@ -436,9 +438,13 @@ def _compute_label_free_quality(
         flatline_frac = float(flat_count) / float(n_windows)
 
     # ── segment_amplitude_range ───────────────────────────────────────────
+    # Use p95−p5 (trimmed range) to avoid extreme tails caused by ADC
+    # saturation spikes.  p99−p1 was dominated by rare saturation events,
+    # producing implausibly large values (mean ~2.3M raw units vs median
+    # ~2.2M but max ~45M — a 20× outlier ratio).
     if len(ecg) >= 2:
-        p1, p99 = np.percentile(ecg, [1, 99])
-        amplitude_range = float(p99 - p1)
+        p5, p95 = np.percentile(ecg, [5, 95])
+        amplitude_range = float(p95 - p5)
     else:
         amplitude_range = np.nan
 
