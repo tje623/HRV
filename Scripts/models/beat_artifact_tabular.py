@@ -82,14 +82,26 @@ logger = logging.getLogger("ecgclean.models.beat_artifact_tabular")
 # ── Default LightGBM parameters ──────────────────────────────────────────────
 
 
+# Beat-level classifier learning rate (lower than config default to prevent
+# early saturation on the dominant global_corr_clean feature).
+LGBM_LEARNING_RATE_BEAT: float = 0.01
+
 DEFAULT_LGBM_PARAMS: dict[str, Any] = {
     "objective": "binary",
-    "metric": ["binary_logloss", "auc"],
+    # Early stopping uses the LAST metric in the list.  binary_logloss is
+    # more granular than AUC — it continues improving as probability
+    # calibration tightens, preventing premature stopping when AUC
+    # plateaus after just a few trees dominated by global_corr_clean.
+    "metric": ["auc", "binary_logloss"],
     "n_estimators": LGBM_N_ESTIMATORS_BEAT,
-    "learning_rate": LGBM_LEARNING_RATE,
+    "learning_rate": LGBM_LEARNING_RATE_BEAT,
     "num_leaves": LGBM_NUM_LEAVES_BEAT,
     "min_child_samples": 20,
-    "feature_fraction": 0.8,
+    # Reduced from 0.8 → 0.4: forces ~60% of trees to build splits without
+    # global_corr_clean, preventing single-feature saturation and encouraging
+    # the model to learn complementary patterns from RR-interval and
+    # morphology features.
+    "feature_fraction": 0.4,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
     "random_state": LGBM_RANDOM_STATE,
