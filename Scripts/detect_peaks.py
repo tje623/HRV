@@ -59,12 +59,8 @@ from config import (
     MERGE_TOLERANCE_MS,
     PEAK_CHUNK_MIN,
 )
+from utils.pipeline_logging import setup_logger, add_logging_args
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
 log = logging.getLogger("ecgclean.detect_peaks")
 
 # Pan-Tompkins / SWT find the peak of an energy envelope, which is biased
@@ -385,7 +381,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    add_logging_args(parser)
+    args = parser.parse_args()
+    global log
+    log = setup_logger("detect_peaks", args=args, disable_log=args.no_log)
+    log.info("=== detect_peaks started ===")
+    log.debug(
+        "Config defaults: SAMPLE_RATE_HZ=%d  REFRACTORY_MS=%d  "
+        "MERGE_TOLERANCE_MS=%d  PEAK_CHUNK_MIN=%d",
+        SAMPLE_RATE_HZ, REFRACTORY_MS, MERGE_TOLERANCE_MS, PEAK_CHUNK_MIN,
+    )
+    log.debug(
+        "Args: ecg_dir=%r  output_dir=%r  fs=%.0f  method=%r  "
+        "chunk_min=%d  refractory_ms=%d  merge_tolerance_ms=%d",
+        str(args.ecg_dir), str(args.output_dir), args.fs, args.method,
+        args.chunk_min, args.refractory_ms, args.merge_tolerance_ms,
+    )
 
     if not args.ecg_dir.is_dir():
         log.error("ECG directory not found: %s", args.ecg_dir)
@@ -420,6 +432,8 @@ def main() -> None:
         )
 
     log.info("Done. %d total peaks across %d file(s)", total_peaks, len(csv_files))
+    log.info("=== detect_peaks complete: %d peaks from %d files → %s ===",
+             total_peaks, len(csv_files), args.output_dir)
 
 
 if __name__ == "__main__":

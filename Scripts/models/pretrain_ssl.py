@@ -94,6 +94,7 @@ from torch.utils.data import DataLoader, Dataset
 
 # ─── Project-root injection for direct script execution ─────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import (
     SAMPLE_RATE_HZ,
     WINDOW_SIZE_SAMPLES,
@@ -104,13 +105,8 @@ from config import (
     LGBM_RANDOM_STATE,
 )
 
-# ─── Logging ────────────────────────────────────────────────────────
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# ─── Logging (file logging wired up in main() via setup_logger) ─────
+logger = logging.getLogger("ecgclean.pretrain_ssl")
 
 # ─── Constants (imported from config: SAMPLE_RATE_HZ, WINDOW_SIZE_SAMPLES) ──
 
@@ -847,7 +843,7 @@ def pretrain(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=10,
         pin_memory=False,
         drop_last=False,
     )
@@ -859,7 +855,7 @@ def pretrain(
             val_ds,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=10,
             pin_memory=False,
             drop_last=False,
         )
@@ -1175,7 +1171,17 @@ def main() -> None:
         "--output", default=None, help="Optional output path for matplotlib figure"
     )
 
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("pretrain_ssl", args=args, disable_log=args.no_log)
+    logger.info("=== pretrain_ssl started | command=%s ===", args.command)
+    logger.debug(
+        "Config: SAMPLE_RATE_HZ=%d  WINDOW_SIZE_SAMPLES=%d  CNN_LEARNING_RATE=%g  "
+        "CNN_MAX_EPOCHS=%d  CNN_BATCH_SIZE=%d  VAL_FRACTION=%.2f",
+        SAMPLE_RATE_HZ, WINDOW_SIZE_SAMPLES, CNN_LEARNING_RATE,
+        CNN_MAX_EPOCHS, CNN_BATCH_SIZE, VAL_FRACTION,
+    )
 
     if args.command == "pretrain":
         pretrain(

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import (
     SAMPLE_RATE_HZ,
     WINDOW_SIZE_SAMPLES,
@@ -37,12 +38,7 @@ from scipy.signal import butter, sosfiltfilt
 from sklearn.metrics import average_precision_score, f1_score
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ecgclean.models.beat_artifact_cnn")
+logger = logging.getLogger("ecgclean.beat_artifact_cnn")
 
 
 def _get_device() -> torch.device:
@@ -857,6 +853,12 @@ def train(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(artifact, out_path)
     logger.info("Saved model artifact → %s", out_path)
+    logger.info(
+        "=== beat_artifact_cnn train complete: PR-AUC=%.4f  F1=%.4f  output=%s ===",
+        final_metrics.get("pr_auc", float("nan")),
+        final_metrics.get("f1", float("nan")),
+        out_path,
+    )
 
     _print_training_summary(
         n_total=len(merged),
@@ -1215,6 +1217,13 @@ def _cli_predict(args: argparse.Namespace) -> None:
             )
 
     logger.info("Saved predictions → %s", out_path)
+    pct_art = 100.0 * total_predicted_artifact / max(total_beats, 1)
+    logger.info(
+        "=== beat_artifact_cnn predict complete: %d beats, %d artifact (%.1f%%), "
+        "%d clean (%.1f%%) → %s ===",
+        total_beats, total_predicted_artifact, pct_art,
+        total_beats - total_predicted_artifact, 100.0 - pct_art, out_path,
+    )
 
     pct = 100.0 * total_predicted_artifact / max(total_beats, 1)
     print(f"\n{'=' * 72}")
@@ -1283,10 +1292,10 @@ def main() -> None:
     )
     tp.add_argument(
         "--num-workers", type=int,
-        default=min(4, max(1, (os.cpu_count() or 4) - 2)),
+        default=10,
         help=(
             "DataLoader worker processes for data prefetching "
-            "(default: min(4, cpu_count-2)).  Set 0 to disable."
+            "(default: 10).  Set 0 to disable."
         ),
     )
 
@@ -1319,7 +1328,17 @@ def main() -> None:
         help="Segments to process per chunk (default: 2000)",
     )
 
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("beat_artifact_cnn", args=args, disable_log=args.no_log)
+    logger.info("=== beat_artifact_cnn started | command=%s ===", args.command)
+    logger.debug(
+        "Config: SAMPLE_RATE_HZ=%d  WINDOW_SIZE_SAMPLES=%d  CNN_BATCH_SIZE=%d  "
+        "CNN_LEARNING_RATE=%g  CNN_MAX_EPOCHS=%d  CNN_DROPOUT=%.2f  VAL_FRACTION=%.2f",
+        SAMPLE_RATE_HZ, WINDOW_SIZE_SAMPLES, CNN_BATCH_SIZE,
+        CNN_LEARNING_RATE, CNN_MAX_EPOCHS, CNN_DROPOUT, VAL_FRACTION,
+    )
 
     if args.command == "train":
         _cli_train(args)

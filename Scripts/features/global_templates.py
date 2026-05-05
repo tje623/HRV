@@ -45,8 +45,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import PEAK_SNAP_SAMPLES, SAMPLE_RATE_HZ, WINDOW_SIZE_SAMPLES
+from utils.pipeline_logging import setup_logger, add_logging_args
 
 import joblib
+
+import concurrent.futures
+import multiprocessing
+import os
+import shutil
+from numba import njit
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -72,12 +80,7 @@ except ImportError:
         return float(r)
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ecgclean.features.global_templates")
+logger = logging.getLogger("ecgclean.global_templates")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 # PEAK_SNAP_SAMPLES, SAMPLE_RATE_HZ, WINDOW_SIZE_SAMPLES imported from config
@@ -93,38 +96,59 @@ logger = logging.getLogger("ecgclean.features.global_templates")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@njit(cache=True)
+def _load_ecg_windows_numba(
+    peak_ts: np.ndarray,
+    ecg_ts: np.ndarray,
+    ecg_vals: np.ndarray,
+    window_size: int,
+    snap_samples: int
+) -> np.ndarray:
+    n_peaks = len(peak_ts)
+    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
+    n_ecg = len(ecg_ts)
+
+    if n_ecg == 0:
+        return windows
+
+    half = window_size // 2
+    insert_idx = np.searchsorted(ecg_ts, peak_ts, side="left")
+
+    for i in range(n_peaks):
+        center = int(insert_idx[i])
+        if center > 0 and center < n_ecg:
+            if abs(ecg_ts[center - 1] - peak_ts[i]) < abs(ecg_ts[center] - peak_ts[i]):
+                center = center - 1
+        elif center >= n_ecg:
+            center = n_ecg - 1
+
+        snap_lo = max(0, center - snap_samples)
+        snap_hi = min(n_ecg, center + snap_samples + 1)
+        center = snap_lo + int(np.argmax(np.abs(ecg_vals[snap_lo:snap_hi])))
+
+        start = center - half
+        end = start + window_size
+
+        src_start = max(0, start)
+        src_end = min(n_ecg, end)
+        dst_start = src_start - start
+        dst_end = dst_start + (src_end - src_start)
+
+        if src_end > src_start:
+            windows[i, dst_start:dst_end] = ecg_vals[src_start:src_end]
+
+    return windows
+
 def _load_ecg_windows(
     peaks_df: pd.DataFrame,
     ecg_samples_df: pd.DataFrame,
     window_size: int = WINDOW_SIZE_SAMPLES,
 ) -> np.ndarray:
-    """Reconstruct ECG windows from ecg_samples for each peak.
-
-    For each peak, extracts ``window_size`` samples centered on the peak
-    timestamp from the ECG time series.  Uses binary search for fast
-    nearest-sample lookup, then snaps the center to argmax(|ecg|) within
-    ±PEAK_SNAP_SAMPLES to correct the Pan-Tompkins MWI bias.
-
-    Args:
-        peaks_df: Peaks table with ``timestamp_ms`` column.
-        ecg_samples_df: ECG samples table with ``timestamp_ms`` and ``ecg``
-            columns, sorted by timestamp_ms.
-        window_size: Number of ECG samples per window (default 64).
-
-    Returns:
-        numpy array of shape (n_peaks, window_size), dtype float32.
-        Rows for peaks that fall outside the ECG time range are zero-padded.
-    """
-    n_peaks = len(peaks_df)
-    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
-
-    ecg_ts   = ecg_samples_df["timestamp_ms"].values.astype(np.int64)
+    """Reconstruct ECG windows from ecg_samples for each peak."""
+    peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
+    ecg_ts = ecg_samples_df["timestamp_ms"].values.astype(np.int64)
     ecg_vals = ecg_samples_df["ecg"].values.astype(np.float32)
-    n_ecg    = len(ecg_ts)
-
-    if n_ecg == 0:
-        logger.warning("No ECG samples available for window reconstruction")
-        return windows
+    return _load_ecg_windows_numba(peak_ts, ecg_ts, ecg_vals, window_size, PEAK_SNAP_SAMPLES)
 
     peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     half    = window_size // 2
@@ -367,6 +391,12 @@ def build_templates(
 
     joblib.dump(payload, output_path)
     logger.info("Saved template → %s", output_path)
+    logger.info(
+        "=== build_templates complete: %d clean beats used, template shape=%s, "
+        "min=%.4f max=%.4f std=%.4f ===",
+        n_clean, template_clean.shape,
+        float(template_clean.min()), float(template_clean.max()), float(template_clean.std()),
+    )
     print(f"\n{'=' * 70}")
     print(f"  Global template built from {n_clean:,} clean beats")
     print(f"  Saved → {output_path}")
@@ -378,146 +408,173 @@ def build_templates(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _correlate_chunk_worker(task: dict) -> tuple[int, str]:
+    chunk_num = task["chunk_num"]
+    n_chunks = task["n_chunks"]
+    seg_min = task["seg_min"]
+    seg_max = task["seg_max"]
+    peaks_path = task["peaks_path"]
+    ecg_samples_path = task["ecg_samples_path"]
+    ckpt_path = task["ckpt_path"]
+    template_clean = task["template_clean"]
+
+    chunk_peaks = (
+        pq.read_table(
+            peaks_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+        )
+        .to_pandas()
+        .sort_values("segment_idx")
+        .reset_index(drop=True)
+    )
+
+    if len(chunk_peaks) == 0:
+        empty_table = pa.table({})
+        pq.write_table(empty_table, ckpt_path)
+        return (chunk_num, ckpt_path)
+
+    logger.info(
+        "[%d/%d] Segments %d–%d | %d peaks",
+        chunk_num, n_chunks, seg_min, seg_max, len(chunk_peaks),
+    )
+
+    ecg_chunk = (
+        pq.read_table(
+            ecg_samples_path,
+            filters=[
+                ("segment_idx", ">=", max(0, seg_min - 1)),
+                ("segment_idx", "<=", seg_max + 1),
+            ],
+            columns=["timestamp_ms", "ecg"],
+        )
+        .to_pandas()
+        .sort_values("timestamp_ms")
+        .reset_index(drop=True)
+    )
+
+    windows = _load_ecg_windows(chunk_peaks, ecg_chunk)
+    corr_clean = _pearson_batch(windows, template_clean)
+
+    schema = pa.schema([
+        ("peak_id", pa.int64()),
+        ("global_corr_clean", pa.float32()),
+    ])
+
+    table = pa.table(
+        {
+            "peak_id": pa.array(chunk_peaks["peak_id"].values, type=pa.int64()),
+            "global_corr_clean": pa.array(corr_clean, type=pa.float32()),
+        },
+        schema=schema,
+    )
+    pq.write_table(table, ckpt_path, compression="snappy")
+    return (chunk_num, ckpt_path)
+
 def correlate_templates(
     templates_path: Path,
     peaks_path: Path,
     ecg_samples_path: Path,
     output_path: Path,
     chunk_segments: int = 5000,
+    workers: int = 10,
+    checkpoint_dir: str = None,
 ) -> None:
-    """Compute per-beat Pearson correlation to each saved template.
-
-    Processes all peaks in segment-keyed chunks — never loads the full ECG
-    parquet into memory.  Writes a two-column parquet:
-    ``(peak_id, global_corr_clean)``.
-
-    Args:
-        templates_path: Path to the .joblib file produced by ``build``.
-        peaks_path: Path to peaks.parquet.
-        ecg_samples_path: Path to ecg_samples.parquet.
-        output_path: Destination parquet for the correlation features.
-        chunk_segments: Number of 60-s segments to process per batch.
-    """
     logger.info("=== CORRELATE: global template features ===")
 
-    # ── Load templates ────────────────────────────────────────────────────────
     logger.info("Loading templates from %s", templates_path)
     tmpl = joblib.load(templates_path)
+    template_clean = tmpl["template_clean"].astype(np.float64)
 
-    template_clean: np.ndarray = tmpl["template_clean"]
-    logger.info(
-        "template_clean loaded — built from %d beats at %s",
-        tmpl.get("n_clean_beats", "?"),
-        tmpl.get("built_at", "?"),
+    logger.info("Scanning segment index from %s", peaks_path)
+    seg_idx_series = (
+        pq.read_table(peaks_path, columns=["segment_idx"])
+        .to_pandas()["segment_idx"]
     )
-    logger.info(
-        "template_clean stats — min: %.4f | max: %.4f | std: %.4f",
-        float(template_clean.min()),
-        float(template_clean.max()),
-        float(template_clean.std()),
-    )
-
-    # Sanity check: template version compatibility
-    tmpl_sr = tmpl.get("sample_rate_hz", None)
-    if tmpl_sr is not None and int(tmpl_sr) != SAMPLE_RATE_HZ:
-        logger.warning(
-            "Template sample_rate_hz=%d but pipeline expects %d — "
-            "correlations may be meaningless",
-            tmpl_sr, SAMPLE_RATE_HZ,
-        )
-
-    # ── Load peaks ────────────────────────────────────────────────────────────
-    logger.info("Loading peaks from %s", peaks_path)
-    peaks_df = pd.read_parquet(peaks_path)
-    logger.info("Peaks: %d total", len(peaks_df))
-
-    # Sort once so each chunk is a contiguous slice (O(log n) boundaries)
-    peaks_sorted = peaks_df.sort_values("segment_idx").reset_index(drop=True)
-    seg_arr  = peaks_sorted["segment_idx"].values
-    all_segs = sorted(peaks_sorted["segment_idx"].unique())
+    all_segs = sorted(seg_idx_series.unique())
     total_segs = len(all_segs)
-    n_chunks   = (total_segs + chunk_segments - 1) // chunk_segments
+    n_chunks = (total_segs + chunk_segments - 1) // chunk_segments
+    del seg_idx_series
 
     logger.info(
         "Processing %d segment(s) in %d chunk(s) of up to %d segments",
         total_segs, n_chunks, chunk_segments,
     )
 
-    # ── Output schema ─────────────────────────────────────────────────────────
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = (
+        Path(checkpoint_dir)
+        if checkpoint_dir
+        else output_path.parent / (output_path.name + ".ckpt")
+    )
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    tasks = []
+    for chunk_num, chunk_start in enumerate(range(0, total_segs, chunk_segments), 1):
+        chunk_segs = all_segs[chunk_start : chunk_start + chunk_segments]
+        seg_min = int(chunk_segs[0])
+        seg_max = int(chunk_segs[-1])
+        ckpt_path = str(ckpt_dir / f"chunk_{chunk_num:05d}.parquet")
+
+        tasks.append({
+            "chunk_num": chunk_num,
+            "n_chunks": n_chunks,
+            "seg_min": seg_min,
+            "seg_max": seg_max,
+            "peaks_path": str(peaks_path),
+            "ecg_samples_path": str(ecg_samples_path),
+            "ckpt_path": ckpt_path,
+            "template_clean": template_clean,
+        })
+
+    completed = []
+    if workers > 1 and tasks:
+        logger.info(
+            "Using %d worker processes (spawn)", workers
+        )
+        mp_ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp_ctx,
+        ) as executor:
+            future_to_task = {
+                executor.submit(_correlate_chunk_worker, t): t for t in tasks
+            }
+            for future in concurrent.futures.as_completed(future_to_task):
+                completed.append(future.result())
+    else:
+        logger.info("Running serially (workers=1)")
+        for t in tasks:
+            completed.append(_correlate_chunk_worker(t))
+
+    completed.sort(key=lambda x: x[0])
+
     schema = pa.schema([
-        ("peak_id",          pa.int64()),
+        ("peak_id", pa.int64()),
         ("global_corr_clean", pa.float32()),
-        # TODO: add global_corr_jitter, global_corr_wander,
-        #       global_corr_low_amplitude, global_corr_saturation
-        #       once artifact prototype templates are built.
     ])
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer: pq.ParquetWriter | None = None
+    writer = None
     total_beats = 0
-
-    # ── Chunk loop ────────────────────────────────────────────────────────────
-    for chunk_num, chunk_start in enumerate(range(0, total_segs, chunk_segments), 1):
-        chunk_segs = all_segs[chunk_start: chunk_start + chunk_segments]
-        seg_min    = int(chunk_segs[0])
-        seg_max    = int(chunk_segs[-1])
-
-        lo = int(np.searchsorted(seg_arr, seg_min, side="left"))
-        hi = int(np.searchsorted(seg_arr, seg_max + 1, side="left"))
-        chunk_peaks = peaks_sorted.iloc[lo:hi].copy()
-
-        if len(chunk_peaks) == 0:
+    for cnum, ckpt_file in completed:
+        tbl = pq.read_table(ckpt_file)
+        if tbl.num_rows == 0:
             continue
-
-        logger.info(
-            "[%d/%d] Segments %d–%d | %d peaks",
-            chunk_num, n_chunks, seg_min, seg_max, len(chunk_peaks),
-        )
-
-        # Predicate pushdown: +/-1 segment buffer so edge-peaks get full windows
-        ecg_chunk = (
-            pq.read_table(
-                ecg_samples_path,
-                filters=[
-                    ("segment_idx", ">=", max(0, seg_min - 1)),
-                    ("segment_idx", "<=", seg_max + 1),
-                ],
-                columns=["timestamp_ms", "ecg"],
-            )
-            .to_pandas()
-            .sort_values("timestamp_ms")
-            .reset_index(drop=True)
-        )
-
-        windows = _load_ecg_windows(chunk_peaks, ecg_chunk)
-        del ecg_chunk
-
-        # Vectorised Pearson correlation against template_clean
-        corr_clean = _pearson_batch(windows, template_clean)
-        del windows
-
-        table = pa.table(
-            {
-                "peak_id":           pa.array(chunk_peaks["peak_id"].values, type=pa.int64()),
-                "global_corr_clean": pa.array(corr_clean,                    type=pa.float32()),
-            },
-            schema=schema,
-        )
-
         if writer is None:
             writer = pq.ParquetWriter(output_path, schema, compression="snappy")
-        writer.write_table(table)
-
-        total_beats += len(chunk_peaks)
-        logger.info("  wrote %d beats (running total: %d)", len(chunk_peaks), total_beats)
+        writer.write_table(tbl)
+        total_beats += tbl.num_rows
 
     if writer is not None:
         writer.close()
 
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+
     logger.info("Saved global template features → %s  (%d beats)", output_path, total_beats)
-    print(f"\n{'=' * 70}")
-    print(f"  Global Template Correlations: {total_beats:,} beats → {output_path}")
-    print(f"{'=' * 70}\n")
+    logger.info("=== correlate_templates complete: %d beats, output=%s ===", total_beats, output_path)
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -571,6 +628,12 @@ def main() -> None:
         default=5000,
         help="Number of 60-s segments to load per ECG read (default: 5000)",
     )
+    build_p.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel worker processes (default: 10)",
+    )
 
     # ── correlate subcommand ──────────────────────────────────────────────────
     corr_p = subparsers.add_parser(
@@ -608,9 +671,29 @@ def main() -> None:
         default=5000,
         help="Number of 60-s segments to process per batch (default: 5000)",
     )
+    corr_p.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel worker processes (default: 10)",
+    )
+    corr_p.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory for per-chunk checkpoint parquet files.",
+    )
 
     # ── dispatch ──────────────────────────────────────────────────────────────
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("global_templates", args=args, disable_log=args.no_log)
+    logger.info("=== global_templates started | subcommand=%s ===", args.subcommand)
+    logger.debug(
+        "Config: WINDOW_SIZE_SAMPLES=%d  SAMPLE_RATE_HZ=%d  PEAK_SNAP_SAMPLES=%d",
+        WINDOW_SIZE_SAMPLES, SAMPLE_RATE_HZ, PEAK_SNAP_SAMPLES,
+    )
 
     if args.subcommand is None:
         parser.print_help()
@@ -648,6 +731,8 @@ def main() -> None:
             ecg_samples_path=Path(args.ecg_samples),
             output_path=Path(args.output),
             chunk_segments=args.chunk_segments,
+            workers=args.workers,
+            checkpoint_dir=args.checkpoint_dir,
         )
 
 

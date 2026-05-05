@@ -43,7 +43,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import PEAK_SNAP_SAMPLES, QRS_WINDOW_SAMPLES
+from utils.pipeline_logging import setup_logger, add_logging_args
 
+from numba import njit
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -69,12 +71,7 @@ except ImportError:
         return float(r)
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ecgclean.features.beat_features")
+logger = logging.getLogger("ecgclean.beat_features")
 
 # Fork-shared globals dict for multiprocessing workers
 
@@ -556,6 +553,10 @@ def compute_beat_feature_matrix(
     )
 
     logger.info("Computing beat feature matrix for %d beats", n)
+    logger.debug(
+        "Input shapes: peaks=%s  labels=%s  ecg_windows=%s  segments=%s",
+        peaks_df.shape, labels_df.shape, ecg_windows.shape, segments_df.shape,
+    )
 
     # ── Sort everything by timestamp for sequential features ──────────────
     sort_order = np.argsort(peaks_df["timestamp_ms"].values)
@@ -582,9 +583,11 @@ def compute_beat_feature_matrix(
     rr_next = _fill_nan_with_segment_median(rr_next, segment_ids)
 
     # ── Feature group 1: Legacy v6 ───────────────────────────────────────
+    logger.debug("Computing Group 1: legacy v6 features (RR stats + ECG window stats)")
     feats = _compute_legacy_features(rr_prev, rr_next, windows_sorted)
 
     # ── Feature group 2: Extended RR context ─────────────────────────────
+    logger.debug("Computing Group 2: extended RR context (wider neighbourhood + local stats)")
     ext_rr = _compute_extended_rr(timestamps, rr_prev, rr_next)  # timestamps already in ms
     # Fill NaN in extended features with segment median
     for key in ("rr_prev_2", "rr_next_2", "rr_local_mean_5", "rr_local_sd_5",
@@ -597,20 +600,30 @@ def compute_beat_feature_matrix(
     # ── Feature group 3: QRS morphology similarity ───────────────────────
     # global_corr_clean (template correlation) is produced separately by
     # global_templates.py and joined on peak_id before Stage 1 training.
+    logger.debug(
+        "Computing Group 3: QRS morphology similarity (adjacent-beat correlation only). "
+        "NOTE: global_corr_clean is NOT included here — produced by global_templates.py "
+        "to avoid label leakage from unannotated beats defaulting to 'clean'."
+    )
     qrs_feats = _compute_qrs_similarity(windows_sorted)
     feats.update(qrs_feats)
 
     # ── Feature group 4: Physio constraint pass-through ──────────────────
-    # Need is_added_peak from peaks, other flags from labels
+    logger.debug("Computing Group 4: physio constraint pass-through from physio_constraints.py")
     physio_labels = labels_sorted.copy()
     physio_labels["is_added_peak"] = peaks_sorted["is_added_peak"].values
     physio_feats = _extract_physio_features(physio_labels)
     feats.update(physio_feats)
 
     # ── Feature group 5: Segment-level context ───────────────────────────
+    logger.debug("Computing Group 5: segment-level context (segment_rr_sd — signal-only)")
     seg_ctx = _compute_segment_context(peaks_sorted, labels_sorted)
 
     # ── Feature group 6: Label-free signal quality ────────────────────────
+    logger.debug(
+        "Computing Group 6: label-free signal quality (IQR, kurtosis, ZCR, SNR, HF noise, "
+        "wander slope, energy ratio) — immune to label contamination"
+    )
     sig_quality_feats = _compute_signal_quality_features(windows_sorted)
     feats.update(sig_quality_feats)
 
@@ -637,11 +650,15 @@ def compute_beat_feature_matrix(
     remaining_nan_cols = nan_counts_before[nan_counts_before > 0]
     if len(remaining_nan_cols) > 0:
         logger.warning(
-            "Filling %d remaining NaN values across %d columns with 0",
+            "Filling %d remaining NaN values across %d columns with 0. "
+            "Affected columns: %s",
             int(nan_counts_before.sum()),
             len(remaining_nan_cols),
+            dict(remaining_nan_cols),
         )
         result.fillna(0.0, inplace=True)
+    else:
+        logger.debug("No NaN values remaining after all fill passes — matrix is clean")
 
     # ── Enforce dtypes ────────────────────────────────────────────────────
     int_cols = [
@@ -668,35 +685,59 @@ def compute_beat_feature_matrix(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@njit(cache=True)
+def _load_ecg_windows_numba(
+    peak_ts: np.ndarray,
+    ecg_ts: np.ndarray,
+    ecg_vals: np.ndarray,
+    window_size: int,
+    snap_samples: int
+) -> np.ndarray:
+    n_peaks = len(peak_ts)
+    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
+    n_ecg = len(ecg_ts)
+
+    if n_ecg == 0:
+        return windows
+
+    half = window_size // 2
+    insert_idx = np.searchsorted(ecg_ts, peak_ts, side="left")
+
+    for i in range(n_peaks):
+        center = int(insert_idx[i])
+        if center > 0 and center < n_ecg:
+            if abs(ecg_ts[center - 1] - peak_ts[i]) < abs(ecg_ts[center] - peak_ts[i]):
+                center = center - 1
+        elif center >= n_ecg:
+            center = n_ecg - 1
+
+        snap_lo = max(0, center - snap_samples)
+        snap_hi = min(n_ecg, center + snap_samples + 1)
+        center = snap_lo + int(np.argmax(np.abs(ecg_vals[snap_lo:snap_hi])))
+
+        start = center - half
+        end = start + window_size
+
+        src_start = max(0, start)
+        src_end = min(n_ecg, end)
+        dst_start = src_start - start
+        dst_end = dst_start + (src_end - src_start)
+
+        if src_end > src_start:
+            windows[i, dst_start:dst_end] = ecg_vals[src_start:src_end]
+
+    return windows
+
 def _load_ecg_windows_from_peaks_csv(
     peaks_df: pd.DataFrame,
     ecg_samples_df: pd.DataFrame,
     window_size: int = QRS_WINDOW_SAMPLES,
 ) -> np.ndarray:
-    """Reconstruct ECG windows from ecg_samples for each peak.
-
-    For each peak, extracts ``window_size`` samples centered on the peak
-    timestamp from the ECG time series.  Uses binary search for fast
-    nearest-sample lookup.
-
-    Args:
-        peaks_df: Peaks table with timestamp_ms.
-        ecg_samples_df: ECG samples table with timestamp_ms and ecg.
-        window_size: Number of ECG samples per window.
-
-    Returns:
-        numpy array of shape (n_peaks, window_size), dtype float32.
-    """
-    n_peaks = len(peaks_df)
-    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
-
+    """Reconstruct ECG windows from ecg_samples for each peak."""
+    peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     ecg_ts = ecg_samples_df["timestamp_ms"].values.astype(np.int64)
     ecg_vals = ecg_samples_df["ecg"].values.astype(np.float32)
-    n_ecg = len(ecg_ts)
-
-    if n_ecg == 0:
-        logger.warning("No ECG samples available for window reconstruction")
-        return windows
+    return _load_ecg_windows_numba(peak_ts, ecg_ts, ecg_vals, window_size, PEAK_SNAP_SAMPLES)
 
     peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     half = window_size // 2
@@ -904,7 +945,19 @@ def main() -> None:
         default=None,
         help="Optional path to segment_quality_preds.parquet for Stage 0 predictions.",
     )
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("beat_features", args=args, disable_log=args.no_log)
+    logger.info("=== beat_features started ===")
+    logger.debug(
+        "Config: PEAK_SNAP_SAMPLES=%d  QRS_WINDOW_SAMPLES=%d",
+        PEAK_SNAP_SAMPLES, QRS_WINDOW_SAMPLES,
+    )
+    logger.debug(
+        "Args: processed_dir=%r  output=%r  chunk_segments=%d  workers=%d",
+        args.processed_dir, args.output, args.chunk_segments, args.workers,
+    )
 
     proc = Path(args.processed_dir)
     for fname in ("peaks.parquet", "labels.parquet", "segments.parquet", "ecg_samples.parquet"):
@@ -1073,6 +1126,7 @@ def main() -> None:
     shutil.rmtree(ckpt_dir, ignore_errors=True)
 
     logger.info("Saved beat features → %s  (%d total beats)", out_path, total_beats)
+    logger.info("=== beat_features complete: %d beats written to %s ===", total_beats, out_path)
     print(f"\n{'=' * 70}")
     print(f"  Beat Feature Matrix: {total_beats:,} beats written to {out_path}")
     print(f"{'=' * 70}\n")

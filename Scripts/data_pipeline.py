@@ -44,25 +44,40 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from config import (
-    SEGMENT_DURATION_MS,
-    DEDUP_TOLERANCE_MS,
-    ANNOTATION_MATCH_TOLERANCE_MS,
-    MIN_VALID_TIMESTAMP_MS,
-    ECG_CHUNK_SIZE,
-    ARTIFACT_FRACTION_BAD,
-    MIN_VALIDATED_BEATS_CLEAN,
-    ECG_INVERSION_THRESHOLD,
-    ECG_INVERSION_WINDOW_SEC,
-    ECG_INVERSION_MIN_WINDOWS,
-    ECG_POLARITY_SAMPLE_STEP,
-)
+try:
+    from .utils.pipeline_logging import setup_logger, add_logging_args
+except ImportError:
+    from utils.pipeline_logging import setup_logger, add_logging_args
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+try:
+    from .config import (
+        SEGMENT_DURATION_MS,
+        DEDUP_TOLERANCE_MS,
+        ANNOTATION_MATCH_TOLERANCE_MS,
+        MIN_VALID_TIMESTAMP_MS,
+        ECG_CHUNK_SIZE,
+        ARTIFACT_FRACTION_BAD,
+        MIN_VALIDATED_BEATS_CLEAN,
+        ECG_INVERSION_THRESHOLD,
+        ECG_INVERSION_WINDOW_SEC,
+        ECG_INVERSION_MIN_WINDOWS,
+        ECG_POLARITY_SAMPLE_STEP,
+    )
+except ImportError:
+    from config import (
+        SEGMENT_DURATION_MS,
+        DEDUP_TOLERANCE_MS,
+        ANNOTATION_MATCH_TOLERANCE_MS,
+        MIN_VALID_TIMESTAMP_MS,
+        ECG_CHUNK_SIZE,
+        ARTIFACT_FRACTION_BAD,
+        MIN_VALIDATED_BEATS_CLEAN,
+        ECG_INVERSION_THRESHOLD,
+        ECG_INVERSION_WINDOW_SEC,
+        ECG_INVERSION_MIN_WINDOWS,
+        ECG_POLARITY_SAMPLE_STEP,
+    )
+
 logger = logging.getLogger("ecgclean.data_pipeline")
 
 
@@ -1709,7 +1724,24 @@ def main() -> None:
         default=None,
         help="Process only the first N ECG files (for debugging; default: all)",
     )
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("data_pipeline", args=args, disable_log=args.no_log)
+    logger.info("=== data_pipeline started ===")
+    logger.debug(
+        "Config: SEGMENT_DURATION_MS=%d  DEDUP_TOLERANCE_MS=%d  "
+        "ANNOTATION_MATCH_TOLERANCE_MS=%d  MIN_VALID_TIMESTAMP_MS=%d  "
+        "ECG_CHUNK_SIZE=%d  ARTIFACT_FRACTION_BAD=%.2f  MIN_VALIDATED_BEATS_CLEAN=%d",
+        SEGMENT_DURATION_MS, DEDUP_TOLERANCE_MS, ANNOTATION_MATCH_TOLERANCE_MS,
+        MIN_VALID_TIMESTAMP_MS, ECG_CHUNK_SIZE, ARTIFACT_FRACTION_BAD, MIN_VALIDATED_BEATS_CLEAN,
+    )
+    logger.debug(
+        "ECG polarity detection: threshold=%.2f  window_sec=%.1f  "
+        "min_windows=%d  sample_step=%d",
+        ECG_INVERSION_THRESHOLD, ECG_INVERSION_WINDOW_SEC,
+        ECG_INVERSION_MIN_WINDOWS, ECG_POLARITY_SAMPLE_STEP,
+    )
 
     # ── Validate input paths ───────────────────────────────────────────────
     if not args.ecg_dir.is_dir():
@@ -1774,6 +1806,11 @@ def main() -> None:
 
     # ── Final status ───────────────────────────────────────────────────────
     status = "PASSED" if valid else "FAILED (see warnings above)"
+    logger.info(
+        "=== data_pipeline complete: %d peaks, %d labels, %d segments | validation=%s ===",
+        len(peaks), len(labels), len(segments), status,
+    )
+    logger.info("Output directory: %s", args.output_dir.resolve())
     print(f"\n{'=' * 60}")
     print(f"  Pipeline complete  |  Validation: {status}")
     print(f"  Output: {args.output_dir.resolve()}")

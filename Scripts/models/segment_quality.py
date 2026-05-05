@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import (
     LGBM_N_ESTIMATORS_SEG,
     LGBM_LEARNING_RATE,
@@ -66,12 +67,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ecgclean.models.segment_quality")
+logger = logging.getLogger("ecgclean.segment_quality")
 
 # ── Label mapping ─────────────────────────────────────────────────────────────
 
@@ -691,7 +687,11 @@ def main() -> None:
         help="Output path for predictions (.parquet)",
     )
 
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("segment_quality", args=args, disable_log=args.no_log)
+    logger.info("=== segment_quality started | command=%s ===", args.command)
 
     if args.command == "train":
         _cli_train(args)

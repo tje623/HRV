@@ -28,20 +28,23 @@ import sys
 from pathlib import Path
 
 import joblib
+
+import concurrent.futures
+import multiprocessing
+import os
+import shutil
+from numba import njit
+from scipy.spatial.distance import cdist
+
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from sklearn.cluster import KMeans
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (file logging wired up in main() via setup_logger)
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
+log = logging.getLogger("ecgclean.motif_features")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -50,6 +53,7 @@ MOTIF_VERSION = "2.0"
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import (
     SAMPLE_RATE_HZ,
     QRS_WINDOW_SAMPLES,
@@ -66,6 +70,7 @@ from config import (
 # ===================================================================== #
 #  ECG window extraction                                                #
 # ===================================================================== #
+@njit(cache=True)
 def _extract_windows_from_arrays(
     peak_ts: np.ndarray,
     ecg_ts: np.ndarray,
@@ -552,7 +557,7 @@ def compute_motif_features(
             _bs = _b.std(axis=1, keepdims=True)
             _b = (_b - _bm) / (_bs + 1e-8)
         _b = _b.astype(np.float32)
-        _d = np.linalg.norm(_b[:, np.newaxis, :] - qrs_centroids[np.newaxis, :, :], axis=2)
+        _d = cdist(_b, qrs_centroids, metric='euclidean')
         nearest_qrs_idx[_i : _i + _DIST_CHUNK] = _d.argmin(axis=1)
         nearest_qrs_dist[_i : _i + _DIST_CHUNK] = _d[
             np.arange(len(_b)), nearest_qrs_idx[_i : _i + _DIST_CHUNK]
@@ -595,7 +600,7 @@ def compute_motif_features(
     nearest_rr_dist = np.empty(n, dtype=np.float32)
     for _i in range(0, n, _DIST_CHUNK):
         _b = rr_windows_norm[_i : _i + _DIST_CHUNK]
-        _d = np.linalg.norm(_b[:, np.newaxis, :] - rr_centroids[np.newaxis, :, :], axis=2)
+        _d = cdist(_b, rr_centroids, metric='euclidean')
         nearest_rr_idx[_i : _i + _DIST_CHUNK] = _d.argmin(axis=1)
         nearest_rr_dist[_i : _i + _DIST_CHUNK] = _d[
             np.arange(len(_b)), nearest_rr_idx[_i : _i + _DIST_CHUNK]
@@ -702,6 +707,79 @@ def load_motifs(motif_dir: str) -> tuple[dict, dict]:
 # ===================================================================== #
 #  CLI                                                                  #
 # ===================================================================== #
+def _compute_chunk_worker(task: dict) -> tuple[int, str]:
+    chunk_num = task["chunk_num"]
+    n_chunks = task["n_chunks"]
+    seg_min = task["seg_min"]
+    seg_max = task["seg_max"]
+    peaks_path = task["peaks_path"]
+    labels_path = task["labels_path"]
+    ecg_samples_path = task["ecg_samples_path"]
+    ckpt_path = task["ckpt_path"]
+    qrs_motifs = task["qrs_motifs"]
+    rr_motifs = task["rr_motifs"]
+
+    chunk_peaks = (
+        pq.read_table(
+            peaks_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+        )
+        .to_pandas()
+        .sort_values("segment_idx")
+        .reset_index(drop=True)
+    )
+
+    if len(chunk_peaks) == 0:
+        empty_table = pa.table({})
+        pq.write_table(empty_table, ckpt_path)
+        return (chunk_num, ckpt_path)
+
+    log.info(
+        "[%d/%d] Segments %d–%d | %d peaks",
+        chunk_num, n_chunks, seg_min, seg_max, len(chunk_peaks),
+    )
+
+    # Load labels
+    chunk_label_ids = set(chunk_peaks["peak_id"])
+    chunk_labels = (
+        pq.read_table(
+            labels_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+        )
+        .to_pandas()
+    )
+    chunk_labels = chunk_labels[chunk_labels["peak_id"].isin(chunk_label_ids)]
+
+    ecg_chunk = (
+        pq.read_table(
+            ecg_samples_path,
+            filters=[
+                ("segment_idx", ">=", max(0, seg_min - 1)),
+                ("segment_idx", "<=", seg_max + 1),
+            ],
+            columns=["timestamp_ms", "ecg", "segment_idx"],
+        )
+        .to_pandas()
+        .sort_values("timestamp_ms")
+        .reset_index(drop=True)
+    )
+
+    chunk_windows = _load_ecg_windows(chunk_peaks, str(ecg_samples_path))
+
+    result_chunk = compute_motif_features(
+        chunk_peaks, chunk_labels, chunk_windows, qrs_motifs, rr_motifs
+    )
+
+    table = pa.Table.from_pandas(result_chunk, preserve_index=False)
+    pq.write_table(table, ckpt_path, compression="snappy")
+    return (chunk_num, ckpt_path)
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="motif_features.py",
@@ -721,12 +799,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_comp.add_argument("--labels", required=True)
     p_comp.add_argument("--motifs", required=True)
     p_comp.add_argument("--output", required=True)
+    p_comp.add_argument("--workers", type=int, default=10)
+    p_comp.add_argument("--chunk-segments", type=int, default=500)
+    p_comp.add_argument("--checkpoint-dir", type=str, default=None)
 
     return parser
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    add_logging_args(parser)
+    args = parser.parse_args()
+    global log
+    log = setup_logger("motif_features", args=args, disable_log=args.no_log)
+    log.info("=== motif_features started | command=%s ===", args.command)
 
     _MAX_DISCOVERY_BEATS = 200_000  # k-means doesn't need all 50M beats
 
@@ -739,6 +825,10 @@ def main() -> None:
         ecg_samples_path = str(proc_dir / "ecg_samples.parquet")
 
         log.info("Loaded: %d peaks, %d labels", len(peaks_df), len(labels_df))
+        log.debug(
+            "Peaks columns: %s | Labels columns: %s",
+            list(peaks_df.columns), list(labels_df.columns),
+        )
 
         # Sample beats for clustering — centroids don't improve with >200K examples
         merged_lbl = peaks_df[["peak_id", "segment_idx", "timestamp_ms"]].merge(
@@ -767,6 +857,13 @@ def main() -> None:
         )
 
         save_motifs(qrs_motifs, rr_motifs, args.output)
+        log.info(
+            "=== motif discover complete: QRS clusters=%d (inertia=%.2f), "
+            "RR clusters=%d (inertia=%.2f), saved to %s ===",
+            len(qrs_motifs["cluster_labels"]), qrs_motifs["inertia"],
+            len(rr_motifs["cluster_labels"]), rr_motifs["inertia"],
+            args.output,
+        )
 
         print(f"\n{'=' * 72}")
         print("  QRS Motif Discovery")
@@ -814,8 +911,8 @@ def main() -> None:
         bf_path = Path(args.beat_features)
         proc_dir = bf_path.parent
 
-        peaks_df = pd.read_parquet(proc_dir / "peaks.parquet")
-        labels_df = pd.read_parquet(args.labels)
+        peaks_path = str(proc_dir / "peaks.parquet")
+        labels_path = str(args.labels)
         ecg_samples_path = str(proc_dir / "ecg_samples.parquet")
 
         qrs_motifs, rr_motifs = load_motifs(args.motifs)
@@ -823,54 +920,119 @@ def main() -> None:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        # Stream by segment chunk — never load all ECG windows at once
-        _COMPUTE_CHUNK = 500
-        peaks_sorted = peaks_df.sort_values("segment_idx").reset_index(drop=True)
-        all_segs = sorted(peaks_sorted["segment_idx"].unique())
-        seg_arr = peaks_sorted["segment_idx"].values
-        writer = None
+        ckpt_dir = (
+            Path(args.checkpoint_dir)
+            if args.checkpoint_dir
+            else out.parent / (out.name + ".ckpt")
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        log.info("Scanning segment index from %s", peaks_path)
+        seg_idx_series = (
+            pq.read_table(peaks_path, columns=["segment_idx"])
+            .to_pandas()["segment_idx"]
+        )
+        all_segs = sorted(seg_idx_series.unique())
+        total_segs = len(all_segs)
+        del seg_idx_series
+
+        chunk_size = args.chunk_segments
+        n_chunks = (total_segs + chunk_size - 1) // chunk_size
 
         log.info(
-            "Computing motif features: %d peaks across %d segments (chunk=%d)",
-            len(peaks_sorted), len(all_segs), _COMPUTE_CHUNK,
+            "Computing motif features: %d segments in %d chunks (chunk_size=%d) → %s",
+            total_segs, n_chunks, chunk_size, out,
         )
 
-        for chunk_start in range(0, len(all_segs), _COMPUTE_CHUNK):
-            chunk_segs = all_segs[chunk_start : chunk_start + _COMPUTE_CHUNK]
-            seg_min, seg_max = int(chunk_segs[0]), int(chunk_segs[-1])
+        tasks = []
+        for chunk_num, chunk_start in enumerate(range(0, total_segs, chunk_size), 1):
+            chunk_segs = all_segs[chunk_start : chunk_start + chunk_size]
+            seg_min = int(chunk_segs[0])
+            seg_max = int(chunk_segs[-1])
+            ckpt_path = str(ckpt_dir / f"chunk_{chunk_num:05d}.parquet")
 
-            lo = int(np.searchsorted(seg_arr, seg_min, side="left"))
-            hi = int(np.searchsorted(seg_arr, seg_max + 1, side="left"))
-            chunk_peaks = peaks_sorted.iloc[lo:hi].reset_index(drop=True)
+            tasks.append({
+                "chunk_num": chunk_num,
+                "n_chunks": n_chunks,
+                "seg_min": seg_min,
+                "seg_max": seg_max,
+                "peaks_path": peaks_path,
+                "labels_path": labels_path,
+                "ecg_samples_path": ecg_samples_path,
+                "ckpt_path": ckpt_path,
+                "qrs_motifs": qrs_motifs,
+                "rr_motifs": rr_motifs,
+            })
 
-            chunk_windows = _load_ecg_windows(chunk_peaks, ecg_samples_path)
-
-            chunk_result = compute_motif_features(
-                chunk_peaks, labels_df, chunk_windows, qrs_motifs, rr_motifs,
-            )
-            del chunk_windows
-
-            table = pa.Table.from_pandas(chunk_result, preserve_index=False)
-            if writer is None:
-                writer = pq_out.ParquetWriter(out, table.schema, compression="snappy")
-            writer.write_table(table)
-
+        completed = []
+        if args.workers > 1 and tasks:
             log.info(
-                "  Chunk %d–%d done (%d peaks)",
-                chunk_start // _COMPUTE_CHUNK + 1,
-                (chunk_start + _COMPUTE_CHUNK - 1) // _COMPUTE_CHUNK + 1,
-                len(chunk_peaks),
+                "Using %d worker processes (spawn)", args.workers
             )
+            mp_ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.workers,
+                mp_context=mp_ctx,
+            ) as executor:
+                future_to_task = {
+                    executor.submit(_compute_chunk_worker, t): t for t in tasks
+                }
+                for future in concurrent.futures.as_completed(future_to_task):
+                    completed.append(future.result())
+        else:
+            log.info("Running serially (workers=1)")
+            for t in tasks:
+                completed.append(_compute_chunk_worker(t))
 
-        if writer:
+        completed.sort(key=lambda x: x[0])
+
+        writer = None
+        for cnum, ckpt_file in completed:
+            tbl = pq.read_table(ckpt_file)
+            if tbl.num_rows == 0:
+                continue
+            if writer is None:
+                writer = pq_out.ParquetWriter(out, tbl.schema, compression="snappy")
+            writer.write_table(tbl)
+
+        if writer is not None:
             writer.close()
-        log.info("Saved motif features → %s", out)
+            log.info("Saved motif features → %s", out)
+            log.info("=== motif compute complete: output=%s ===", out)
+        else:
+            log.error("No segments processed — output not written")
+            sys.exit(1)
+
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
 
         result = pd.read_parquet(out)
 
         n = len(result)
         print(f"\n{'=' * 72}")
         print("  Motif Feature Computation")
+        print(f"{'=' * 72}")
+        print(f"  Total beats: {n}")
+        if n > 0:
+            print(f"\n  QRS motif distribution:")
+            for lbl, cnt in result["nearest_qrs_motif_label"].value_counts().items():
+                print(f"    {lbl}: {cnt} ({100.0 * cnt / n:.1f}%)")
+            print(f"\n  RR motif distribution:")
+            for lbl, cnt in result["nearest_rr_motif_label"].value_counts().items():
+                print(f"    {lbl}: {cnt} ({100.0 * cnt / n:.1f}%)")
+            print(
+                f"\n  QRS anomaly score: mean={result['qrs_anomaly_score'].mean():.4f}"
+                f"  max={result['qrs_anomaly_score'].max():.4f}"
+            )
+            print(
+                f"  RR anomaly score:  mean={result['rr_anomaly_score'].mean():.4f}"
+                f"  max={result['rr_anomaly_score'].max():.4f}"
+            )
+            print(f"  QRS anomalies (>2×): {result['is_qrs_anomaly'].sum()}")
+            print(f"  RR anomalies (>2×):  {result['is_rr_anomaly'].sum()}")
+
+            dummies = get_motif_dummies(result)
+            print(f"\n  One-hot columns ({len(dummies.columns)}): {list(dummies.columns)}")
+
         print(f"{'=' * 72}")
         print(f"  Total beats: {n}")
         if n > 0:

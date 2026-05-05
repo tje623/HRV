@@ -28,32 +28,50 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from config import (
-    HR_MODAL_LOW_BPM,
-    HR_MODAL_HIGH_BPM,
-    HR_SUSPICIOUS_LOW_BPM,
-    HR_SUSPICIOUS_HIGH_BPM,
-    RR_SUSPICIOUS_SHORT_MS,
-    RR_SUSPICIOUS_LONG_MS,
-    RR_SANDWICH_SHORT_MS,
-    RR_NORMAL_LOW_MS,
-    RR_NORMAL_HIGH_MS,
-    POTS_MAX_DELTA_HR_PER_SEC,
-    POTS_TRANSITION_WINDOW_SEC,
-    TACHY_TRANSITION_MIN_RISE_BPM,
-    TACHY_TRANSITION_LOOK_AHEAD_SEC,
-    TACHY_TRANSITION_SMOOTH_BEATS,
-)
+try:
+    from .config import (
+        HR_MODAL_LOW_BPM,
+        HR_MODAL_HIGH_BPM,
+        HR_SUSPICIOUS_LOW_BPM,
+        HR_SUSPICIOUS_HIGH_BPM,
+        RR_SUSPICIOUS_SHORT_MS,
+        RR_SUSPICIOUS_LONG_MS,
+        RR_SANDWICH_SHORT_MS,
+        RR_NORMAL_LOW_MS,
+        RR_NORMAL_HIGH_MS,
+        POTS_MAX_DELTA_HR_PER_SEC,
+        POTS_TRANSITION_WINDOW_SEC,
+        TACHY_TRANSITION_MIN_RISE_BPM,
+        TACHY_TRANSITION_LOOK_AHEAD_SEC,
+        TACHY_TRANSITION_SMOOTH_BEATS,
+    )
+except ImportError:
+    from config import (
+        HR_MODAL_LOW_BPM,
+        HR_MODAL_HIGH_BPM,
+        HR_SUSPICIOUS_LOW_BPM,
+        HR_SUSPICIOUS_HIGH_BPM,
+        RR_SUSPICIOUS_SHORT_MS,
+        RR_SUSPICIOUS_LONG_MS,
+        RR_SANDWICH_SHORT_MS,
+        RR_NORMAL_LOW_MS,
+        RR_NORMAL_HIGH_MS,
+        POTS_MAX_DELTA_HR_PER_SEC,
+        POTS_TRANSITION_WINDOW_SEC,
+        TACHY_TRANSITION_MIN_RISE_BPM,
+        TACHY_TRANSITION_LOOK_AHEAD_SEC,
+        TACHY_TRANSITION_SMOOTH_BEATS,
+    )
+
+try:
+    from .utils.pipeline_logging import setup_logger, add_logging_args
+except ImportError:
+    from utils.pipeline_logging import setup_logger, add_logging_args
 
 # ── Derived constants (internal) ───────────────────────────────────────────────
 
 _POTS_WINDOW_MS: int = int(POTS_TRANSITION_WINDOW_SEC * 1000)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger("ecgclean.physio_constraints")
 
 
@@ -711,6 +729,24 @@ def run(processed_dir: str) -> None:
     # ── Print summary ─────────────────────────────────────────────────────
     summary = get_constraint_summary(labels_df)
     _print_summary(labels_df, summary)
+    logger.info(
+        "=== physio_constraints complete: %d labels enriched, %d hard-filtered ===",
+        len(labels_df),
+        int(labels_df["hard_filtered"].sum()) if "hard_filtered" in labels_df.columns else -1,
+    )
+    if "physio_implausible" in labels_df.columns:
+        logger.info(
+            "Constraint flags: physio_implausible=%d  pots_transition=%d  "
+            "tachy_transition=%d  hr_suspicious_low=%d  hr_suspicious_high=%d  "
+            "rr_suspicious_short=%d  rr_suspicious_long=%d",
+            int(labels_df.get("physio_implausible", pd.Series([0])).sum()),
+            int(labels_df.get("pots_transition_candidate", pd.Series([0])).sum()),
+            int(labels_df.get("tachy_transition_candidate", pd.Series([0])).sum()),
+            int(labels_df.get("hr_suspicious_low", pd.Series([0])).sum()),
+            int(labels_df.get("hr_suspicious_high", pd.Series([0])).sum()),
+            int(labels_df.get("rr_suspicious_short", pd.Series([0])).sum()),
+            int(labels_df.get("rr_suspicious_long", pd.Series([0])).sum()),
+        )
 
 
 def _print_summary(labels_df: pd.DataFrame, summary: dict[str, Any]) -> None:
@@ -778,7 +814,22 @@ def main() -> None:
         required=True,
         help="Directory containing peaks.parquet, labels.parquet, segments.parquet",
     )
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("physio_constraints", args=args, disable_log=args.no_log)
+    logger.info("=== physio_constraints started ===")
+    logger.debug(
+        "Config: HR_MODAL_LOW=%d  HR_MODAL_HIGH=%d  HR_SUSPICIOUS_LOW=%d  HR_SUSPICIOUS_HIGH=%d  "
+        "RR_SUSPICIOUS_SHORT_MS=%d  RR_SUSPICIOUS_LONG_MS=%d  RR_SANDWICH_SHORT_MS=%d  "
+        "RR_NORMAL_LOW_MS=%d  RR_NORMAL_HIGH_MS=%d  POTS_MAX_DELTA_HR_PER_SEC=%.1f  "
+        "POTS_TRANSITION_WINDOW_SEC=%.1f  TACHY_TRANSITION_MIN_RISE_BPM=%d",
+        HR_MODAL_LOW_BPM, HR_MODAL_HIGH_BPM, HR_SUSPICIOUS_LOW_BPM, HR_SUSPICIOUS_HIGH_BPM,
+        RR_SUSPICIOUS_SHORT_MS, RR_SUSPICIOUS_LONG_MS, RR_SANDWICH_SHORT_MS,
+        RR_NORMAL_LOW_MS, RR_NORMAL_HIGH_MS, POTS_MAX_DELTA_HR_PER_SEC,
+        POTS_TRANSITION_WINDOW_SEC, TACHY_TRANSITION_MIN_RISE_BPM,
+    )
+    logger.debug("Args: processed_dir=%r", args.processed_dir)
     run(args.processed_dir)
 
 

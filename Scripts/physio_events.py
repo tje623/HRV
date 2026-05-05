@@ -23,12 +23,9 @@ import pyarrow.parquet as pq
 from scipy.signal import find_peaks
 
 from config import PEAKS_PARQUET, AUTODETECTED_DIR
+from utils.pipeline_logging import setup_logger, add_logging_args
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ecgclean.physio_events")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -368,7 +365,18 @@ def main() -> None:
                    help=f"Min peak-to-trough amplitude for RSA (ms)  (default: {RSA_MIN_AMPLITUDE_MS})")
     p.add_argument("--rsa-min-cycles", type=int, default=RSA_MIN_CYCLES,
                    help=f"Min full cycles per RSA event  (default: {RSA_MIN_CYCLES})")
+    add_logging_args(p)
     args = p.parse_args()
+    global logger
+    logger = setup_logger("physio_events", args=args, disable_log=args.no_log)
+    logger.info("=== physio_events started ===")
+    logger.debug(
+        "Args: peaks=%r  output_dir=%r  arrest_min_pause_ms=%.0f  "
+        "arrest_min_ratio=%.2f  rsa_min_amplitude_ms=%.0f  rsa_min_cycles=%d",
+        str(args.peaks), str(args.output_dir),
+        args.arrest_min_pause_ms, args.arrest_min_ratio,
+        args.rsa_min_amplitude_ms, args.rsa_min_cycles,
+    )
 
     if not args.peaks.exists():
         logger.error("peaks.parquet not found: %s", args.peaks)
@@ -414,6 +422,11 @@ def main() -> None:
     print()
     print(f"  Output: {args.output_dir.resolve()}")
     print(f"{sep}\n")
+    logger.info(
+        "=== physio_events complete: %d peaks analysed, %d vagal arrests, %d RSA events ===",
+        len(peaks), len(arrests), len(rsa),
+    )
+    logger.info("Outputs: arrests=%s  rsa=%s", arrest_path, rsa_path)
 
 
 if __name__ == "__main__":

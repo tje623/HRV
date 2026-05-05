@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import (
     LGBM_N_ESTIMATORS_BEAT,
     LGBM_LEARNING_RATE,
@@ -72,12 +73,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ecgclean.models.beat_artifact_tabular")
+logger = logging.getLogger("ecgclean.beat_artifact_tabular")
 
 # ── Default LightGBM parameters ──────────────────────────────────────────────
 
@@ -773,6 +769,10 @@ def train(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, out_path)
     logger.info("Saved model artifact → %s", out_path)
+    logger.info(
+        "=== beat_artifact_tabular train complete: PR-AUC=%.4f  output=%s ===",
+        metrics.get("pr_auc", float("nan")), out_path,
+    )
 
     # ── Print training summary ────────────────────────────────────────────
     n_val_artifact = int(y_val.sum()) if len(y_val) > 0 else 0
@@ -1257,6 +1257,13 @@ def _cli_predict(args: argparse.Namespace) -> None:
             )
 
     logger.info("Saved predictions → %s", out_path)
+    _pct_art = 100.0 * total_artifact / max(total_beats, 1)
+    logger.info(
+        "=== beat_artifact_tabular predict complete: %d beats, %d artifact (%.1f%%), "
+        "%d clean (%.1f%%) → %s ===",
+        total_beats, total_artifact, _pct_art,
+        total_beats - total_artifact, 100.0 - _pct_art, out_path,
+    )
 
     # ── Print summary ──────────────────────────────────────────────────────
     n_clean = total_beats - total_artifact
@@ -1405,7 +1412,11 @@ def main() -> None:
         ),
     )
 
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("beat_artifact_tabular", args=args, disable_log=args.no_log)
+    logger.info("=== beat_artifact_tabular started | command=%s ===", args.command)
 
     if args.command == "train":
         _cli_train(args)

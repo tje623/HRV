@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import SAMPLE_RATE_HZ, VAL_FRACTION, LGBM_RANDOM_STATE, CNN_MAX_EPOCHS
 
 import numpy as np
@@ -49,12 +50,7 @@ from torch.utils.data import DataLoader, Dataset
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
+log = logging.getLogger("ecgclean.segment_cnn_2d")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -196,8 +192,8 @@ def _compute_and_cache_ecg(args: tuple) -> None:
     ECG is passed in-process — no parquet I/O inside the worker, so all
     cores do pure CPU work (CWT) without fighting over the SSD.
     """
-    seg_idx, ecg_array, cache_path, mtime_hash = args
-    cache_file = Path(cache_path) / f"seg_{seg_idx}_{mtime_hash}.npy"
+    seg_idx, ecg_array, cache_path = args
+    cache_file = Path(cache_path) / f"seg_{seg_idx}.npy"
     if cache_file.exists():
         return
     scalogram = compute_scalogram(ecg_array)
@@ -210,7 +206,7 @@ def _prewarm_cache(
     segment_indices: np.ndarray,
     ecg_samples_path: str,
     cache_base: str | Path = "data/processed/scalogram_cache",
-    batch_size: int = 500,
+    batch_size: int = 2500,
 ) -> None:
     """Compute and cache scalograms: sequential I/O, then parallel CWT.
 
@@ -221,21 +217,16 @@ def _prewarm_cache(
     from concurrent.futures import ProcessPoolExecutor
 
     cache = _cache_dir(cache_base)
-    mtime_hash = ""
-    if Path(ecg_samples_path).exists():
-        mtime_hash = hashlib.md5(
-            str(os.path.getmtime(ecg_samples_path)).encode()
-        ).hexdigest()[:8]
 
     missing = sorted(
         int(s) for s in segment_indices
-        if not (cache / f"seg_{int(s)}_{mtime_hash}.npy").exists()
+        if not (cache / f"seg_{int(s)}.npy").exists()
     )
     if not missing:
         log.info("Scalogram cache: all %d segments already cached", len(segment_indices))
         return
 
-    n_workers = min(12, os.cpu_count() or 4)
+    n_workers = 12
     log.info(
         "Pre-warming scalogram cache: %d/%d segments to compute (%d workers, batch=%d)",
         len(missing), len(segment_indices), n_workers, batch_size,
@@ -265,7 +256,7 @@ def _prewarm_cache(
 
             worker_args = [
                 (seg, ecg_by_seg.get(seg, np.array([], dtype=np.float64)),
-                 str(cache_base), mtime_hash)
+                 str(cache_base))
                 for seg in batch
             ]
             list(pool.map(_compute_and_cache_ecg, worker_args))
@@ -702,7 +693,7 @@ def predict(
     # Dataset (no augmentation) — pre-warm cache then load in parallel
     _prewarm_cache(segments["segment_idx"].values, ecg_samples_path)
     ds = SegmentScalogramDataset(ecg_samples_path, segments, training=False)
-    n_workers = min(8, os.cpu_count() or 4)
+    n_workers = 10
     dl = DataLoader(
         ds, batch_size=batch_size, shuffle=False,
         num_workers=n_workers, persistent_workers=True, pin_memory=True,
@@ -871,7 +862,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    add_logging_args(parser)
+    args = parser.parse_args()
+    global log
+    log = setup_logger("segment_cnn_2d", args=args, disable_log=args.no_log)
+    log.info("=== segment_cnn_2d started | command=%s ===", args.command)
 
     if args.command == "train":
         train(

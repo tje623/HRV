@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import ENSEMBLE_ALPHA, ENSEMBLE_THRESHOLD
 
 import joblib
@@ -38,12 +39,7 @@ from sklearn.metrics import average_precision_score, f1_score
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.INFO,
-)
-log = logging.getLogger(__name__)
+log = logging.getLogger("ecgclean.ensemble")
 
 # ---------------------------------------------------------------------------
 # Valid artifact labels (same label vocabulary used across the pipeline)
@@ -314,7 +310,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    add_logging_args(parser)
+    args = parser.parse_args()
+    global log
+    log = setup_logger("ensemble", args=args, disable_log=args.no_log)
+    log.info("=== ensemble started | command=%s ===", args.command)
+    log.debug("Config: ENSEMBLE_ALPHA=%.3f  ENSEMBLE_THRESHOLD=%.3f", ENSEMBLE_ALPHA, ENSEMBLE_THRESHOLD)
 
     if args.command == "fuse":
         tab = pd.read_parquet(args.tabular_preds)
@@ -341,6 +343,15 @@ def main() -> None:
         out.parent.mkdir(parents=True, exist_ok=True)
         result.to_parquet(out, index=False, compression="snappy")
         log.info("Saved ensemble predictions → %s", out)
+        _n = len(result)
+        _n_art = int(result["predicted_artifact"].sum())
+        log.info(
+            "=== ensemble fuse complete: %d beats, %d artifact (%.1f%%), "
+            "%d clean (%.1f%%), threshold=%.3f → %s ===",
+            _n, _n_art, 100.0 * _n_art / max(_n, 1),
+            _n - _n_art, 100.0 * (_n - _n_art) / max(_n, 1),
+            args.threshold, out,
+        )
 
         # ── Summary ──────────────────────────────────────────────────
         n = len(result)

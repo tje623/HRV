@@ -48,6 +48,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utils.pipeline_logging import setup_logger, add_logging_args
 from config import (
     SAMPLE_RATE_HZ,
     QRS_WINDOW_SAMPLES,
@@ -56,6 +57,13 @@ from config import (
     HR_MODAL_LOW_BPM,
     SEGMENT_DURATION_MS,
 )
+
+
+import concurrent.futures
+import multiprocessing
+import os
+import shutil
+from numba import njit
 
 import numpy as np
 import pandas as pd
@@ -79,12 +87,7 @@ except ImportError:
             return 0.0
         return float(r)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("ecgclean.features.segment_features")
+logger = logging.getLogger("ecgclean.segment_features")
 
 # SAMPLE_RATE_HZ imported from config (Polar H10 effective ECG sample rate = 130 Hz)
 
@@ -238,47 +241,32 @@ def _compute_sqi_qrs(
     windows: np.ndarray,
     hard_filtered: np.ndarray,
 ) -> float:
-    """Compute Signal Quality Index based on QRS morphology consistency.
-
-    SQI_QRS is the mean Pearson correlation between consecutive non-hard-
-    filtered beat windows.  Uses ALL beats regardless of label — the prior
-    "clean" filter was leaky because unannotated beats default to "clean".
-
-    Hard-filtered beats are still excluded because they represent
-    structurally impossible intervals (e.g., refractory violation), not
-    an annotation judgment.
-
-    High values (> 0.9) indicate clean signal; low values (< 0.7) suggest
-    noise or artifact.
-
-    Args:
-        windows: (n_beats, QRS_WINDOW_SAMPLES) ECG windows for beats in
-            this segment.
-        hard_filtered: Boolean hard-filter flags (True = structurally
-            impossible, always excluded).
-
-    Returns:
-        Mean inter-beat correlation, or NaN if insufficient valid beats.
-    """
+    """Compute Signal Quality Index based on QRS morphology consistency."""
     valid_mask = ~hard_filtered
     valid_idx = np.where(valid_mask)[0]
 
     if len(valid_idx) < _MIN_BEATS_SQI:
         return np.nan
 
-    correlations: list[float] = []
-    for k in range(len(valid_idx) - 1):
-        i, j = valid_idx[k], valid_idx[k + 1]
-        r = pearson_corr_safe(
-            windows[i].astype(np.float64),
-            windows[j].astype(np.float64),
-        )
-        correlations.append(r)
+    w = windows[valid_idx].astype(np.float64)
+    w1 = w[:-1]
+    w2 = w[1:]
 
-    if len(correlations) == 0:
+    w1_c = w1 - w1.mean(axis=1, keepdims=True)
+    w2_c = w2 - w2.mean(axis=1, keepdims=True)
+
+    num = np.einsum("ij,ij->i", w1_c, w2_c)
+    denom = np.sqrt(np.einsum("ij,ij->i", w1_c, w1_c)) * np.sqrt(np.einsum("ij,ij->i", w2_c, w2_c))
+    
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.where(denom > 0, num / denom, 0.0)
+
+    r = np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if len(r) == 0:
         return np.nan
 
-    return float(np.mean(correlations))
+    return float(np.mean(r))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -530,6 +518,11 @@ def compute_segment_feature_matrix(
         "Computing segment features for %d segments (%d peaks, %d ECG samples)",
         len(all_seg_idx), n_peaks, len(ecg_samples_df),
     )
+    logger.debug(
+        "Minimum thresholds: HRV needs >=%d beats, roughness >=%d, SQI >=%d, "
+        "signal-quality >=%d ECG samples. Segments below thresholds get NaN (NOT dropped).",
+        _MIN_BEATS_HRV, _MIN_BEATS_ROUGHNESS, _MIN_BEATS_SQI, _MIN_ECG_SAMPLES_QUALITY,
+    )
 
     # Pre-group merged by segment_idx — avoids O(n_segments * n_peaks) boolean scan
     beats_by_seg = {
@@ -612,34 +605,54 @@ def compute_segment_feature_matrix(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@njit(cache=True)
+def _load_ecg_windows_numba(
+    peak_ts: np.ndarray,
+    ecg_ts: np.ndarray,
+    ecg_vals: np.ndarray,
+    window_size: int,
+) -> np.ndarray:
+    n_peaks = len(peak_ts)
+    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
+    n_ecg = len(ecg_ts)
+
+    if n_ecg == 0:
+        return windows
+
+    half = window_size // 2
+    insert_idx = np.searchsorted(ecg_ts, peak_ts, side="left")
+
+    for i in range(n_peaks):
+        center = int(insert_idx[i])
+        if center > 0 and center < n_ecg:
+            if abs(ecg_ts[center - 1] - peak_ts[i]) < abs(ecg_ts[center] - peak_ts[i]):
+                center = center - 1
+        elif center >= n_ecg:
+            center = n_ecg - 1
+
+        start = center - half
+        end = start + window_size
+
+        src_start = max(0, start)
+        src_end = min(n_ecg, end)
+        dst_start = src_start - start
+        dst_end = dst_start + (src_end - src_start)
+
+        if src_end > src_start:
+            windows[i, dst_start:dst_end] = ecg_vals[src_start:src_end]
+
+    return windows
+
 def _load_ecg_windows(
     peaks_df: pd.DataFrame,
     ecg_samples_df: pd.DataFrame,
     window_size: int = QRS_WINDOW_SAMPLES,
 ) -> np.ndarray:
-    """Reconstruct ECG windows from ecg_samples for each peak.
-
-    For each peak, extracts ``window_size`` samples centered on the peak
-    timestamp from the ECG time series using binary search.
-
-    Args:
-        peaks_df: Peaks table with timestamp_ms.
-        ecg_samples_df: ECG samples table with timestamp_ms and ecg.
-        window_size: Number of ECG samples per window
-            (default QRS_WINDOW_SAMPLES = 0.5 s @ 130 Hz).
-
-    Returns:
-        numpy array of shape (n_peaks, window_size), dtype float32.
-    """
-    n_peaks = len(peaks_df)
-    windows = np.zeros((n_peaks, window_size), dtype=np.float32)
-
+    """Reconstruct ECG windows from ecg_samples for each peak."""
+    peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     ecg_ts = ecg_samples_df["timestamp_ms"].values.astype(np.int64)
     ecg_vals = ecg_samples_df["ecg"].values.astype(np.float32)
-    n_ecg = len(ecg_ts)
-
-    if n_ecg == 0:
-        return windows
+    return _load_ecg_windows_numba(peak_ts, ecg_ts, ecg_vals, window_size)
 
     peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     half = window_size // 2
@@ -673,6 +686,79 @@ def _load_ecg_windows(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _process_chunk_worker(task: dict) -> tuple[int, str]:
+    chunk_num = task["chunk_num"]
+    n_chunks = task["n_chunks"]
+    seg_min = task["seg_min"]
+    seg_max = task["seg_max"]
+    peaks_path = task["peaks_path"]
+    labels_path = task["labels_path"]
+    ecg_samples_path = task["ecg_samples_path"]
+    ckpt_path = task["ckpt_path"]
+
+    chunk_peaks = (
+        pq.read_table(
+            peaks_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+        )
+        .to_pandas()
+        .sort_values("segment_idx")
+        .reset_index(drop=True)
+    )
+
+    if len(chunk_peaks) == 0:
+        empty_table = pa.table({})
+        pq.write_table(empty_table, ckpt_path)
+        return (chunk_num, ckpt_path)
+
+    logger.info(
+        "[%d/%d] Segments %d–%d | %d peaks",
+        chunk_num, n_chunks, seg_min, seg_max, len(chunk_peaks),
+    )
+
+    # Load labels
+    chunk_label_ids = set(chunk_peaks["peak_id"])
+    chunk_labels = (
+        pq.read_table(
+            labels_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+        )
+        .to_pandas()
+    )
+    chunk_labels = chunk_labels[chunk_labels["peak_id"].isin(chunk_label_ids)]
+
+    ecg_chunk = (
+        pq.read_table(
+            ecg_samples_path,
+            filters=[
+                ("segment_idx", ">=", seg_min),
+                ("segment_idx", "<=", seg_max),
+            ],
+            columns=["timestamp_ms", "ecg", "segment_idx"],
+        )
+        .to_pandas()
+        .sort_values("timestamp_ms")
+        .reset_index(drop=True)
+    )
+
+    chunk_windows = _load_ecg_windows(chunk_peaks, ecg_chunk)
+
+    result_chunk = compute_segment_feature_matrix(
+        chunk_peaks, chunk_labels, ecg_chunk, chunk_windows
+    )
+    
+    table = pa.Table.from_pandas(result_chunk, preserve_index=True)
+    pq.write_table(table, ckpt_path, compression="snappy")
+
+    return (chunk_num, ckpt_path)
+
+
 def main() -> None:
     """CLI entry point for segment feature computation."""
     parser = argparse.ArgumentParser(
@@ -700,32 +786,64 @@ def main() -> None:
         default=1000,
         help="Segments to process per chunk (default: 1000)",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel worker processes (default: 10)",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory for per-chunk checkpoint parquet files.",
+    )
+    add_logging_args(parser)
     args = parser.parse_args()
+    global logger
+    logger = setup_logger("segment_features", args=args, disable_log=args.no_log)
+    logger.info("=== segment_features started ===")
+    logger.debug(
+        "Config: SAMPLE_RATE_HZ=%d  QRS_WINDOW_SAMPLES=%d  SEGMENT_DURATION_MS=%d  "
+        "HR_MODAL_LOW_BPM=%d  MIN_BEATS_HRV=%d  MIN_BEATS_SQI=%d",
+        SAMPLE_RATE_HZ, QRS_WINDOW_SAMPLES, SEGMENT_DURATION_MS,
+        HR_MODAL_LOW_BPM, _MIN_BEATS_HRV, _MIN_BEATS_SQI,
+    )
+    logger.debug(
+        "Args: processed_dir=%r  output=%r  chunk_segments=%d  workers=%d",
+        args.processed_dir, args.output, args.chunk_segments, args.workers,
+    )
 
     proc = Path(args.processed_dir)
-    ecg_samples_path = proc / "ecg_samples.parquet"
-    for fname in ("peaks.parquet", "labels.parquet", "ecg_samples.parquet"):
-        p = proc / fname
-        if not p.exists():
+    ecg_samples_path = str(proc / "ecg_samples.parquet")
+    peaks_path = str(proc / "peaks.parquet")
+    labels_path = str(proc / "labels.parquet")
+    
+    for p in (peaks_path, labels_path, ecg_samples_path):
+        if not Path(p).exists():
             logger.error("Required file not found: %s", p)
             sys.exit(1)
-
-    # Load small tables into RAM — never load ecg_samples.parquet directly
-    logger.info("Loading peaks and labels from %s", proc)
-    peaks_df = pd.read_parquet(proc / "peaks.parquet")
-    labels_df = pd.read_parquet(proc / "labels.parquet")
-    logger.info("Loaded: %d peaks, %d labels", len(peaks_df), len(labels_df))
 
     out_path = Path(args.output) if args.output else proc / "segment_features.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    chunk_size = args.chunk_segments
+    ckpt_dir = (
+        Path(args.checkpoint_dir)
+        if args.checkpoint_dir
+        else out_path.parent / (out_path.name + ".ckpt")
+    )
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Sort peaks by segment_idx for O(log n) chunk slicing via searchsorted
-    peaks_sorted = peaks_df.sort_values("segment_idx").reset_index(drop=True)
-    seg_arr = peaks_sorted["segment_idx"].values
-    all_segs = sorted(peaks_sorted["segment_idx"].unique())
+    logger.info("Scanning segment index from %s", peaks_path)
+    seg_idx_series = (
+        pq.read_table(peaks_path, columns=["segment_idx"])
+        .to_pandas()["segment_idx"]
+    )
+    all_segs = sorted(seg_idx_series.unique())
     total_segs = len(all_segs)
+    del seg_idx_series
+
+    chunk_size = args.chunk_segments
     n_chunks = (total_segs + chunk_size - 1) // chunk_size
 
     logger.info(
@@ -733,61 +851,64 @@ def main() -> None:
         total_segs, n_chunks, chunk_size, out_path,
     )
 
-    writer: pq.ParquetWriter | None = None
-
+    tasks = []
     for chunk_num, chunk_start in enumerate(range(0, total_segs, chunk_size), 1):
         chunk_segs = all_segs[chunk_start : chunk_start + chunk_size]
         seg_min = int(chunk_segs[0])
         seg_max = int(chunk_segs[-1])
+        ckpt_path = str(ckpt_dir / f"chunk_{chunk_num:05d}.parquet")
+        
+        tasks.append({
+            "chunk_num": chunk_num,
+            "n_chunks": n_chunks,
+            "seg_min": seg_min,
+            "seg_max": seg_max,
+            "peaks_path": peaks_path,
+            "labels_path": labels_path,
+            "ecg_samples_path": ecg_samples_path,
+            "ckpt_path": ckpt_path,
+        })
 
+    completed = []
+    if args.workers > 1 and tasks:
         logger.info(
-            "Chunk %d/%d: segments %d–%d", chunk_num, n_chunks, seg_min, seg_max
+            "Using %d worker processes (spawn)", args.workers
         )
+        mp_ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.workers,
+            mp_context=mp_ctx,
+        ) as executor:
+            future_to_task = {
+                executor.submit(_process_chunk_worker, t): t for t in tasks
+            }
+            for future in concurrent.futures.as_completed(future_to_task):
+                completed.append(future.result())
+    else:
+        logger.info("Running serially (workers=1)")
+        for t in tasks:
+            completed.append(_process_chunk_worker(t))
 
-        # Slice peaks for this segment range using binary search
-        lo = int(np.searchsorted(seg_arr, seg_min, side="left"))
-        hi = int(np.searchsorted(seg_arr, seg_max + 1, side="left"))
-        chunk_peaks = peaks_sorted.iloc[lo:hi].copy().reset_index(drop=True)
+    completed.sort(key=lambda x: x[0])
 
-        if len(chunk_peaks) == 0:
-            logger.warning("No peaks for segments %d–%d — skipping", seg_min, seg_max)
+    writer = None
+    for cnum, ckpt_file in completed:
+        tbl = pq.read_table(ckpt_file)
+        if tbl.num_rows == 0:
             continue
-
-        # Read ECG samples for this segment range via predicate pushdown
-        ecg_chunk = pq.read_table(
-            ecg_samples_path,
-            filters=[
-                ("segment_idx", ">=", seg_min),
-                ("segment_idx", "<=", seg_max),
-            ],
-            columns=["timestamp_ms", "ecg", "segment_idx"],
-        ).to_pandas().sort_values("timestamp_ms").reset_index(drop=True)
-
-        # Build ECG windows for the peaks in this chunk
-        chunk_windows = _load_ecg_windows(chunk_peaks, ecg_chunk)
-
-        # Filter labels to only peaks in this chunk — avoids merging all 50M rows
-        chunk_label_ids = set(chunk_peaks["peak_id"])
-        chunk_labels = labels_df[labels_df["peak_id"].isin(chunk_label_ids)]
-
-        # Compute all five feature groups for these segments
-        result_chunk = compute_segment_feature_matrix(
-            chunk_peaks, chunk_labels, ecg_chunk, chunk_windows
-        )
-        del ecg_chunk, chunk_windows
-
-        # Stream-write to output parquet
-        table = pa.Table.from_pandas(result_chunk, preserve_index=True)
         if writer is None:
-            writer = pq.ParquetWriter(out_path, table.schema, compression="snappy")
-        writer.write_table(table)
+            writer = pq.ParquetWriter(out_path, tbl.schema, compression="snappy")
+        writer.write_table(tbl)
 
     if writer is not None:
         writer.close()
         logger.info("Saved segment features → %s", out_path)
+        logger.info("=== segment_features complete: %d segments → %s ===", total_segs, out_path)
     else:
         logger.error("No segments processed — output not written")
         sys.exit(1)
+
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
 
     # ── Print summary (segment_features is small — safe to read back) ─────
     result = pd.read_parquet(out_path)
@@ -812,6 +933,7 @@ def main() -> None:
     pd.set_option("display.width", 200)
     print(result.head(3).to_string())
     print(f"{'=' * 70}\n")
+
 
 
 if __name__ == "__main__":
