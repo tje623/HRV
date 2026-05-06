@@ -18,8 +18,8 @@ Designed for non-stationary data with variable heart rate (e.g. POTS):
   - Multi-detector ensemble reduces missed beats without requiring retraining
 
 Input format (same as existing ECG CSVs):
-    DateTime (epoch ms integer)   ECG (float mV)
-    1770893409028                 -1.701
+    DateTime (epoch ms integer)   ECG_uV (integer microvolts)
+    1768599639606                 240
     ...
 
 Output (one peak CSV per input file, in --output-dir):
@@ -236,9 +236,6 @@ def process_file(
     valid = np.isfinite(ecg_signal)
     timestamps_ms = timestamps_ms[valid]
     ecg_signal = ecg_signal[valid]
-
-    # Convert mV → µV (Polar H10 CSVs are in millivolts)
-    ecg_signal = ecg_signal * 1000.0
 
     if len(ecg_signal) == 0:
         log.warning("  No valid samples in %s — skipping", ecg_path.name)

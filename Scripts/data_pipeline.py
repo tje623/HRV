@@ -2,13 +2,44 @@
 """
 ecgclean/data_pipeline.py — Step 1: Data Ingestion & Canonical Table Emission
 
-Reads raw ECG CSVs, R-peak CSVs, and artifact_annotation.json to produce
-four canonical Parquet tables consumed by all downstream pipeline stages:
+Reads raw ECG CSVs, R-peak CSVs, and a directory of three annotation parquet
+files (``beats.parquet``, ``segments.parquet``, ``bad_regions.parquet``) to
+produce four canonical Parquet tables consumed by all downstream pipeline
+stages:
 
   ecg_samples.parquet  — raw ECG time series with segment assignments
   peaks.parquet        — deduplicated R-peak catalog
   labels.parquet       — beat-level artifact/quality labels
   segments.parquet     — segment-level quality labels
+
+Annotation input contract (``--annotations`` is a directory):
+
+  beats.parquet
+    timestamp_ms (int64), segment_idx (int32), label (str: clean | artifact |
+    physio), original_annotation (str), is_added_peak (bool),
+    beat_training_eligible (bool). Scope: training-eligible beats only —
+    beats from unreviewed/revisit/bad/bad-region segments are pre-excluded.
+
+  segments.parquet
+    segment_idx, start_ms, end_ms, review_status (reviewed | revisit |
+    unreviewed), segment_quality_label (usable | partial | unusable |
+    unknown), in_revisit_pile, has_bad_region, bad_region_count,
+    beat_training_eligible_segment, segment_quality_training_eligible.
+
+  bad_regions.parquet
+    segment_idx, region_idx_within_segment, start_ms, end_ms,
+    original_annotation. Each row is a bad time interval inside an
+    otherwise-usable segment.
+
+Label mapping into the canonical tables:
+  beats.label "clean"    → labels.label "clean",    phys_event_window=False
+  beats.label "artifact" → labels.label "artifact", phys_event_window=False
+  beats.label "physio"   → labels.label "phys_event", phys_event_window=True
+  Peaks not present in beats.parquet → label "clean", reviewed=False
+  segment_quality_label "usable"   → quality_label "clean"
+  segment_quality_label "partial"  → quality_label "noisy_ok"
+  segment_quality_label "unusable" → quality_label "bad"
+  segment_quality_label "unknown"  → quality_label "unknown"
 
 Memory model: ECG CSVs are NEVER fully loaded into RAM.
   1. scan_recording_start_ns() — reads only the first row of each ECG file
@@ -23,14 +54,13 @@ Usage:
     python data_pipeline.py \\
         --ecg-dir data/raw_ecg/ \\
         --peaks-dir data/peaks/ \\
-        --annotations data/annotations/artifact_annotation.json \\
+        --annotations Data/Annotations/INPUT/ \\
         --output-dir data/processed/
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import sys
@@ -56,12 +86,6 @@ try:
         ANNOTATION_MATCH_TOLERANCE_MS,
         MIN_VALID_TIMESTAMP_MS,
         ECG_CHUNK_SIZE,
-        ARTIFACT_FRACTION_BAD,
-        MIN_VALIDATED_BEATS_CLEAN,
-        ECG_INVERSION_THRESHOLD,
-        ECG_INVERSION_WINDOW_SEC,
-        ECG_INVERSION_MIN_WINDOWS,
-        ECG_POLARITY_SAMPLE_STEP,
     )
 except ImportError:
     from config import (
@@ -70,12 +94,6 @@ except ImportError:
         ANNOTATION_MATCH_TOLERANCE_MS,
         MIN_VALID_TIMESTAMP_MS,
         ECG_CHUNK_SIZE,
-        ARTIFACT_FRACTION_BAD,
-        MIN_VALIDATED_BEATS_CLEAN,
-        ECG_INVERSION_THRESHOLD,
-        ECG_INVERSION_WINDOW_SEC,
-        ECG_INVERSION_MIN_WINDOWS,
-        ECG_POLARITY_SAMPLE_STEP,
     )
 
 logger = logging.getLogger("ecgclean.data_pipeline")
@@ -225,291 +243,43 @@ def timestamps_match_with_tolerance(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def get_annotation_key(annotations: dict[str, Any], *keys: str, default: Any = None) -> Any:
-    """Return the value for the first matching key in the annotations dict.
+# Mapping from beats.parquet `label` values to canonical labels.parquet values.
+BEAT_LABEL_MAP: dict[str, str] = {
+    "clean": "clean",
+    "artifact": "artifact",
+    "physio": "phys_event",
+}
 
-    Supports alternate key names between the spec and actual annotation files
-    (e.g. 'manually_added_missed_peaks' vs 'added_r_peaks').
-
-    Args:
-        annotations: The parsed annotation JSON dict.
-        *keys: One or more key names to try, in priority order.
-        default: Value to return if no key is found (defaults to empty list).
-
-    Returns:
-        The value from the first matching key, or default.
-    """
-    for key in keys:
-        if key in annotations:
-            return annotations[key]
-    if default is not None:
-        return default
-    logger.warning("None of keys %s found in annotations; using empty list", keys)
-    return []
-
-
-def parse_phys_event_windows(raw: list[Any]) -> list[tuple[int, int]]:
-    """Parse tagged_physiological_events into (start_ns, end_ns) tuples.
-
-    Handles two formats found in the wild:
-      - List of dicts with start/end or start_time/end_time keys → window
-      - List of bare epoch-ms timestamps → point event (start == end)
-
-    Args:
-        raw: Raw list from the annotation JSON.
-
-    Returns:
-        Sorted list of (start_ns, end_ns) tuples.
-    """
-    windows: list[tuple[int, int]] = []
-    for item in raw:
-        if isinstance(item, dict):
-            start_val = (
-                item.get("start")
-                or item.get("start_time")
-                or item.get("start_timestamp")
-            )
-            end_val = (
-                item.get("end")
-                or item.get("end_time")
-                or item.get("end_timestamp")
-            )
-            if start_val is not None and end_val is not None:
-                start_ns = parse_timestamp_to_ns(start_val)
-                end_ns = parse_timestamp_to_ns(end_val)
-                if start_ns is not None and end_ns is not None:
-                    windows.append((start_ns, end_ns))
-                else:
-                    logger.warning("Could not parse phys event dict timestamps: %r", item)
-            else:
-                logger.warning("Phys event dict missing start/end keys: %r", item)
-        else:
-            # Bare timestamp → point event
-            ns = parse_timestamp_to_ns(item)
-            if ns is not None:
-                windows.append((ns, ns))
-            else:
-                logger.warning("Could not parse phys event timestamp: %r", item)
-    windows.sort(key=lambda w: w[0])
-    return windows
-
-
-def _build_ann_to_pipeline_map(
-    annotations: dict[str, Any],
-    recording_start_ns: int,
-) -> dict[int, int]:
-    """Build a mapping from annotation segment index to pipeline segment_idx.
-
-    The annotation tool numbers segments sequentially within the compiled file
-    (0, 1, 2, …).  The pipeline assigns segment_idx as elapsed 60-second windows
-    from recording_start_ns.  'segment_timestamps' in the annotation JSON maps
-    each annotation index to its actual first_timestamp, allowing conversion.
-
-    Args:
-        annotations: Parsed annotation JSON dict.
-        recording_start_ns: Pipeline recording start in epoch nanoseconds.
-
-    Returns:
-        Dict mapping annotation_seg_idx (int) → pipeline segment_idx (int).
-    """
-    mapping: dict[int, int] = {}
-    for entry in annotations.get("segment_timestamps", []):
-        ann_idx = entry.get("segment_idx")
-        ts_str = entry.get("first_timestamp")
-        if ann_idx is None or ts_str is None:
-            continue
-        try:
-            ts_ns = int(pd.Timestamp(ts_str).value) // 1_000_000
-            pipeline_idx = (ts_ns - recording_start_ns) // SEGMENT_DURATION_MS
-            mapping[int(ann_idx)] = int(pipeline_idx)
-        except Exception:
-            logger.warning("Could not parse segment_timestamps entry: %r", entry)
-    return mapping
-
-
-def extract_validated_segment_indices(
-    annotations: dict[str, Any],
-    recording_start_ns: int,
-) -> set[int]:
-    """Return the set of pipeline segment_idx values that were manually reviewed.
-
-    The annotation tool numbers segments sequentially within the compiled file
-    (seg_0, seg_1, …), while the pipeline assigns segment_idx as the number of
-    complete 60-second windows elapsed since recording_start_ns.  These two
-    numbering systems only coincide by accident.
-
-    This function translates using 'segment_timestamps', which maps each
-    annotation segment index to its first_timestamp.  The pipeline segment_idx
-    is then recovered with the same formula the pipeline itself uses:
-
-        pipeline_seg_idx = (first_timestamp_ms - recording_start_ns) // SEGMENT_DURATION_MS
-
-    Args:
-        annotations: The parsed annotation JSON dict.
-        recording_start_ns: Epoch nanoseconds of the recording start, as
-            computed by the pipeline (min of ECG and peak start timestamps).
-
-    Returns:
-        Set of pipeline integer segment_idx values that were reviewed.
-        Empty set if the key is absent.
-    """
-    # ── Translate annotation indices → pipeline indices ──────────────────
-    ann_to_pipeline = _build_ann_to_pipeline_map(annotations, recording_start_ns)
-
-    if not ann_to_pipeline:
-        logger.warning(
-            "'segment_timestamps' absent or empty — falling back to raw index "
-            "passthrough for validated_segments (indices may not match pipeline)"
-        )
-
-    # ── Convert validated_segments annotation indices to pipeline indices ──
-    reviewed: set[int] = set()
-    n_no_mapping = 0
-    for seg in get_annotation_key(annotations, "validated_segments", default=[]):
-        if isinstance(seg, (int, np.integer)):
-            ann_idx = int(seg)
-        elif isinstance(seg, str):
-            try:
-                ann_idx = int(seg.replace("seg_", ""))
-            except ValueError:
-                logger.warning("Could not parse validated segment identifier: %r", seg)
-                continue
-        else:
-            continue
-
-        if ann_to_pipeline:
-            if ann_idx in ann_to_pipeline:
-                reviewed.add(ann_to_pipeline[ann_idx])
-            else:
-                n_no_mapping += 1
-        else:
-            reviewed.add(ann_idx)  # fallback: pass through raw index
-
-    if n_no_mapping:
-        logger.warning(
-            "%d validated segments had no entry in segment_timestamps — skipped",
-            n_no_mapping,
-        )
-
-    if reviewed:
-        logger.info(
-            "Validated (reviewed) segments: %d annotation entries → %d pipeline indices",
-            len(get_annotation_key(annotations, "validated_segments", default=[])),
-            len(reviewed),
-        )
-    else:
-        logger.warning(
-            "No 'validated_segments' key found — all beats will be marked unreviewed"
-        )
-    return reviewed
-
-
-def extract_bad_segment_indices(
-    annotations: dict[str, Any],
-    recording_start_ns: int,
-) -> set[int]:
-    """Collect all pipeline segment_idx values flagged as bad from annotation keys.
-
-    Checks: bad_segments, bad_regions (by segment_idx), flagged_poor_quality_segments.
-    All annotation segment indices are translated to pipeline segment_idx using
-    segment_timestamps (same coordinate-system translation as validated_segments).
-
-    Args:
-        annotations: The parsed annotation JSON dict.
-        recording_start_ns: Pipeline recording start in epoch nanoseconds.
-
-    Returns:
-        Set of pipeline integer segment_idx values flagged as bad.
-    """
-    ann_to_pipeline = _build_ann_to_pipeline_map(annotations, recording_start_ns)
-
-    def _translate(ann_idx: int) -> int | None:
-        if ann_to_pipeline:
-            return ann_to_pipeline.get(ann_idx)
-        return ann_idx  # fallback if no segment_timestamps
-
-    bad: set[int] = set()
-
-    for seg in get_annotation_key(annotations, "bad_segments", default=[]):
-        if isinstance(seg, (int, np.integer)):
-            p = _translate(int(seg))
-            if p is not None:
-                bad.add(p)
-
-    for seg in get_annotation_key(
-        annotations, "flagged_poor_quality_segments", default=[]
-    ):
-        if isinstance(seg, (int, np.integer)):
-            ann_idx = int(seg)
-        elif isinstance(seg, str):
-            try:
-                ann_idx = int(seg.replace("seg_", ""))
-            except ValueError:
-                logger.warning("Could not parse segment identifier: %r", seg)
-                continue
-        else:
-            continue
-        p = _translate(ann_idx)
-        if p is not None:
-            bad.add(p)
-
-    return bad
+# Mapping from segments.parquet `segment_quality_label` to canonical
+# segments.parquet `quality_label` values consumed by segment_quality.py.
+SEGMENT_QUALITY_MAP: dict[str, str] = {
+    "usable": "clean",
+    "partial": "noisy_ok",
+    "unusable": "bad",
+    "unknown": "unknown",
+}
 
 
 def extract_bad_region_time_ranges(
-    annotations: dict[str, Any],
-    recording_start_ns: int,
+    bad_regions_df: pd.DataFrame,
 ) -> list[tuple[int, int, int]]:
-    """Return (pipeline_seg_idx, start_ns, end_ns) tuples for all bad_regions.
+    """Return ``(segment_idx, start_ms, end_ms)`` tuples from bad_regions.parquet.
 
-    bad_regions are time-bounded windows within a segment that are
-    uninterpretable.  Unlike bad_segments, they do NOT invalidate the whole
-    segment — only beats whose timestamp falls inside the window are affected.
-
-    Args:
-        annotations: Parsed annotation JSON dict.
-        recording_start_ns: Pipeline recording start in epoch nanoseconds.
-
-    Returns:
-        List of (pipeline_seg_idx, start_ns, end_ns) tuples, one per window.
-        Malformed entries are silently dropped with a warning.
+    Each row marks a time-bounded window within an otherwise-usable segment
+    that is uninterpretable. Beats whose timestamp falls inside any window
+    must be excluded from training (but may still be scored at inference).
     """
-    ann_to_pipeline = _build_ann_to_pipeline_map(annotations, recording_start_ns)
-    result: list[tuple[int, int, int]] = []
-
-    for region in get_annotation_key(annotations, "bad_regions", default=[]):
-        if not isinstance(region, dict):
-            continue
-        ann_idx = region.get("segment_idx")
-        start_str = region.get("start_time")
-        end_str = region.get("end_time")
-        if ann_idx is None or start_str is None or end_str is None:
-            logger.warning("Malformed bad_region entry (skipped): %r", region)
-            continue
-        if ann_to_pipeline:
-            pipeline_idx = ann_to_pipeline.get(int(ann_idx))
-            if pipeline_idx is None:
-                logger.warning(
-                    "bad_region segment_idx=%d has no pipeline mapping (skipped)",
-                    ann_idx,
-                )
-                continue
-        else:
-            pipeline_idx = int(ann_idx)  # fallback: pass-through raw index
-        try:
-            start_ns = int(pd.Timestamp(start_str).value) // 1_000_000
-            end_ns = int(pd.Timestamp(end_str).value) // 1_000_000
-        except Exception:
-            logger.warning("Could not parse bad_region timestamps (skipped): %r", region)
-            continue
-        result.append((int(pipeline_idx), int(start_ns), int(end_ns)))
-
-    if result:
-        segs = len({r[0] for r in result})
-        logger.info(
-            "Bad-region time ranges: %d windows across %d segment(s)",
-            len(result), segs,
-        )
+    if len(bad_regions_df) == 0:
+        return []
+    seg = bad_regions_df["segment_idx"].astype(np.int64).to_numpy()
+    s = bad_regions_df["start_ms"].astype(np.int64).to_numpy()
+    e = bad_regions_df["end_ms"].astype(np.int64).to_numpy()
+    result = [(int(seg[i]), int(s[i]), int(e[i])) for i in range(len(seg))]
+    n_segs = len({r[0] for r in result})
+    logger.info(
+        "Bad-region time ranges: %d window(s) across %d segment(s)",
+        len(result), n_segs,
+    )
     return result
 
 
@@ -568,111 +338,11 @@ def _process_one_ecg_file(
     if ecg_col is None:
         ecg_col = header_df.columns[1]
 
-    # ── Step 2a: small consecutive sample → ts format + fs estimation ─────────
-    # Only needs a few hundred consecutive rows; larger reads waste time here.
-    _fmt_sample = pd.read_csv(csv_path, nrows=1_000)
-    sample_val   = _fmt_sample[ts_col].iloc[0]
-    ts_is_string = isinstance(sample_val, str)
-
-    if ts_is_string:
-        _sample_ts = _fmt_sample[ts_col].apply(parse_timestamp_to_ns).dropna().values.astype(np.int64)
-    else:
-        _sample_ts = _fmt_sample[ts_col].values.astype(np.int64)
-    _fs_est = 60.0  # fallback
-    if len(_sample_ts) > 1:
-        _fs_est = 1000 / float(np.median(np.diff(_sample_ts)))
-
-    # ── Step 2b: file-wide evenly-spaced sample → polarity detection ──────────
-    # Read every ECG_POLARITY_SAMPLE_STEP-th row so that the sample spans the
-    # entire recording, not just the opening minutes.  pandas scans the file once
-    # (skipping parse on unselected rows) so this is roughly one sequential read.
-    _pol_sample = pd.read_csv(
-        csv_path,
-        usecols=[ts_col, ecg_col],
-        skiprows=lambda i: i > 0 and i % ECG_POLARITY_SAMPLE_STEP != 0,
-    )
-
-    if ts_is_string:
-        _s_ts_ser = _pol_sample[ts_col].apply(parse_timestamp_to_ns)
-        _s_valid  = _s_ts_ser.notna()
-        _s_ts     = _s_ts_ser[_s_valid].values.astype(np.int64)
-        _s_ecg    = pd.to_numeric(_pol_sample.loc[_s_valid, ecg_col], errors="coerce").values.astype(np.float32)
-    else:
-        _s_ts   = _pol_sample[ts_col].values.astype(np.int64)
-        _s_raw  = pd.to_numeric(_pol_sample[ecg_col], errors="coerce").values
-        _s_fin  = np.isfinite(_s_raw)
-        _s_ts   = _s_ts[_s_fin]
-        _s_ecg  = _s_raw[_s_fin].astype(np.float32)
-    _s_valid_ts = _s_ts >= MIN_VALID_TIMESTAMP_MS
-    _s_ts  = _s_ts[_s_valid_ts]
-    _s_ecg = _s_ecg[_s_valid_ts]
-
-    invert = False
-    # Window size in sparse-sample space: ECG_INVERSION_WINDOW_SEC of real time
-    # spans (_fs_est * ECG_INVERSION_WINDOW_SEC / ECG_POLARITY_SAMPLE_STEP) sparse rows.
-    # At step=10, fs=130: 130/10 = ~13 sparse samples per 1-second window.
-    _sparse_win = max(3, round(_fs_est * ECG_INVERSION_WINDOW_SEC / ECG_POLARITY_SAMPLE_STEP))
-    _nw = len(_s_ecg) // _sparse_win
-    logger.info(
-        "  [polarity] %s — sampled %d rows (1 in %d) spanning full file → %d windows",
-        csv_path.name, len(_s_ecg), ECG_POLARITY_SAMPLE_STEP, _nw,
-    )
-    if _nw >= ECG_INVERSION_MIN_WINDOWS:
-        # Dominant amplitude per window: value at argmax(abs) within each sparse window
-        _dom = np.array([
-            _s_ecg[w * _sparse_win + int(np.argmax(np.abs(_s_ecg[w * _sparse_win:(w + 1) * _sparse_win])))]
-            for w in range(_nw)
-        ])
-        _dom_median = float(np.median(_dom))
-        _dom_p10    = float(np.percentile(_dom, 10))
-        _dom_p90    = float(np.percentile(_dom, 90))
-        logger.info(
-            "  [polarity] %s — dominant-amplitude median=%.4f mV, p10=%.4f, p90=%.4f",
-            csv_path.name, _dom_median, _dom_p10, _dom_p90,
-        )
-        if _dom_median < ECG_INVERSION_THRESHOLD:
-            logger.info(
-                "  [polarity] %s — INVERTING sign  (threshold=%.3f mV)",
-                csv_path.name, ECG_INVERSION_THRESHOLD,
-            )
-            invert = True
-            # ── Diagnostic PNG ────────────────────────────────────────────────
-            try:
-                import matplotlib
-                matplotlib.use("Agg")
-                import matplotlib.pyplot as plt
-                _diag_dir = staging_path.parent.parent / "diagnostics" / "polarity"
-                _diag_dir.mkdir(parents=True, exist_ok=True)
-                # Plot the dominant-amplitude distribution across the full recording
-                _t_approx = np.arange(_nw) * ECG_INVERSION_WINDOW_SEC
-                fig, ax = plt.subplots(figsize=(14, 3))
-                ax.plot(_t_approx, _dom, lw=0.5, color="steelblue", alpha=0.8)
-                ax.axhline(0, color="gray", lw=0.5, ls="--")
-                ax.axhline(_dom_median, color="red", lw=0.8, ls="--",
-                           label=f"median={_dom_median:.3f} mV")
-                ax.axhline(ECG_INVERSION_THRESHOLD, color="orange", lw=0.8, ls=":",
-                           label=f"threshold={ECG_INVERSION_THRESHOLD:.3f} mV")
-                ax.legend(fontsize=8)
-                ax.set_title(
-                    f"{csv_path.name}  →  INVERTED (sign will be flipped)\n"
-                    f"dominant-amp median={_dom_median:.4f} mV  p10={_dom_p10:.4f}  "
-                    f"p90={_dom_p90:.4f}  windows={_nw}  sample_step=1/{ECG_POLARITY_SAMPLE_STEP}",
-                    fontsize=9,
-                )
-                ax.set_xlabel("Approx. position (s, uniform sample)")
-                ax.set_ylabel("Dominant ECG amplitude (mV)")
-                fig.tight_layout()
-                _png_path = _diag_dir / (csv_path.stem + "_polarity_check.png")
-                fig.savefig(_png_path, dpi=100)
-                plt.close(fig)
-                logger.info("  [polarity] diagnostic PNG → %s", _png_path.name)
-            except Exception as _png_err:
-                logger.warning("  [polarity] could not save diagnostic PNG: %s", _png_err)
-        else:
-            logger.info(
-                "  [polarity] %s — OK  (threshold=%.3f mV)",
-                csv_path.name, ECG_INVERSION_THRESHOLD,
-            )
+    # ── Step 2: detect timestamp format (string ISO vs numeric epoch ms) ──
+    # Only needs the first row; reading 1k rows is cheap and avoids
+    # mis-detecting on a malformed first line.
+    _fmt_sample = pd.read_csv(csv_path, nrows=1)
+    ts_is_string = isinstance(_fmt_sample[ts_col].iloc[0], str)
 
     # ── Step 3: stream full CSV in chunks → ParquetWriter ─────────────────
     schema  = pa.schema([
@@ -707,12 +377,6 @@ def _process_one_ecg_file(
 
                 if len(ts_c) == 0:
                     continue
-
-                # Convert mV → µV (Polar H10 CSVs are in millivolts)
-                ecg_c = ecg_c * 1000.0
-
-                if invert:
-                    ecg_c = ecg_c * -1.0
 
                 seg_c = ((ts_c - recording_start_ns) // SEGMENT_DURATION_MS).astype(np.int32)
 
@@ -1034,51 +698,96 @@ def load_peak_csvs(peaks_dir: Path) -> pd.DataFrame:
     return result
 
 
-def load_annotations(annotations_path: Path) -> dict[str, Any]:
-    """Load artifact_annotation.json with graceful handling of missing keys.
+def load_annotation_inputs(
+    annotations_path: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load the three annotation parquet files from the input directory.
 
-    Logs warnings for expected keys that are not present. Never crashes on
-    missing or unexpected structure.
+    Expects ``annotations_path`` to be a directory containing:
+      - beats.parquet        (beat-level labels, training-eligible only)
+      - segments.parquet     (segment-level review status + quality)
+      - bad_regions.parquet  (bad time intervals inside otherwise-usable segments)
+
+    The legacy ``artifact_annotation.json`` is no longer accepted: passing a
+    JSON path raises a SystemExit so misuses fail loudly instead of silently
+    re-introducing the legacy V1 ``validated_segments`` mismatch.
 
     Args:
-        annotations_path: Path to the JSON annotation file.
+        annotations_path: Path to the annotation INPUT directory.
 
     Returns:
-        Parsed dict (empty dict if file not found).
+        ``(beats_df, segments_df, bad_regions_df)``. If the directory is
+        absent, all three are empty DataFrames with the expected columns.
     """
-    if not annotations_path.exists():
+    if annotations_path.is_file() and annotations_path.suffix.lower() == ".json":
+        raise SystemExit(
+            f"--annotations was given a JSON file ({annotations_path}). "
+            f"This pipeline now consumes the parquet annotation inputs. Pass a "
+            f"directory containing beats.parquet, segments.parquet, and "
+            f"bad_regions.parquet (e.g. Data/Annotations/INPUT/)."
+        )
+
+    beats_cols = [
+        "timestamp_ms", "segment_idx", "label", "original_annotation",
+        "is_added_peak", "beat_training_eligible",
+    ]
+    seg_cols = [
+        "segment_idx", "start_ms", "end_ms", "review_status",
+        "segment_quality_label", "in_revisit_pile", "has_bad_region",
+        "bad_region_count", "beat_training_eligible_segment",
+        "segment_quality_training_eligible",
+    ]
+    br_cols = [
+        "segment_idx", "region_idx_within_segment", "start_ms", "end_ms",
+        "original_annotation",
+    ]
+
+    if not annotations_path.is_dir():
         logger.warning(
-            "Annotation file not found: %s — proceeding with empty annotations",
+            "Annotation directory not found: %s — proceeding with empty inputs",
             annotations_path,
         )
-        return {}
+        return (
+            pd.DataFrame(columns=beats_cols),
+            pd.DataFrame(columns=seg_cols),
+            pd.DataFrame(columns=br_cols),
+        )
 
-    with open(annotations_path, "r") as f:
-        data = json.load(f)
+    beats_path = annotations_path / "beats.parquet"
+    segs_path = annotations_path / "segments.parquet"
+    br_path = annotations_path / "bad_regions.parquet"
 
-    # Check for expected keys and their known alternates
-    expected_and_alts = {
-        "artifacts": [],
-        "validated_true_beats": ["validated_segments"],
-        "bad_segments": [],
-        "bad_regions": [],
-        "flagged_poor_quality_segments": [],
-        "manually_added_missed_peaks": ["added_r_peaks"],
-        "tagged_physiological_events": [],
-        "flagged_for_interpolation": [],
-        "interpolated_replacements": [],
-    }
-    for key, alts in expected_and_alts.items():
-        if key not in data:
-            found_alt = any(a in data for a in alts)
-            if found_alt:
-                alt_name = next(a for a in alts if a in data)
-                logger.info("Using alternate key '%s' for expected '%s'", alt_name, key)
-            else:
-                logger.warning("Annotation key '%s' not found (no alternates either)", key)
+    missing = [p.name for p in (beats_path, segs_path, br_path) if not p.exists()]
+    if missing:
+        raise SystemExit(
+            f"Annotation directory {annotations_path} is missing required "
+            f"file(s): {missing}. Expected beats.parquet, segments.parquet, "
+            f"bad_regions.parquet."
+        )
 
-    logger.info("Loaded annotations with %d top-level keys", len(data))
-    return data
+    beats_df = pd.read_parquet(beats_path)
+    segments_df = pd.read_parquet(segs_path)
+    bad_regions_df = pd.read_parquet(br_path)
+
+    logger.info(
+        "Loaded annotations from %s: %d beats, %d segments, %d bad_regions",
+        annotations_path, len(beats_df), len(segments_df), len(bad_regions_df),
+    )
+
+    # Surface input label distributions so the pipeline log captures what was
+    # consumed (helps detect stale or partially-rebuilt inputs).
+    if len(beats_df) > 0 and "label" in beats_df.columns:
+        logger.info(
+            "Input beat label distribution: %s",
+            beats_df["label"].value_counts().to_dict(),
+        )
+    if len(segments_df) > 0 and "segment_quality_label" in segments_df.columns:
+        logger.info(
+            "Input segment_quality_label distribution: %s",
+            segments_df["segment_quality_label"].value_counts().to_dict(),
+        )
+
+    return beats_df, segments_df, bad_regions_df
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1088,17 +797,19 @@ def load_annotations(annotations_path: Path) -> dict[str, Any]:
 
 def build_peaks(
     peak_csv_df: pd.DataFrame,
-    annotations: dict[str, Any],
+    beats_df: pd.DataFrame,
     recording_start_ns: int,
 ) -> pd.DataFrame:
     """Build the deduplicated peaks canonical table.
 
-    Merges R-peaks from CSV with manually added peaks from annotations.
-    Deduplicates within 10ms tolerance, preferring annotation timestamps.
+    Merges R-peaks from CSV with manually added peaks pulled from
+    ``beats.parquet`` (rows where ``is_added_peak`` is True). Deduplicates
+    within ``DEDUP_TOLERANCE_MS``, preferring annotation rows.
 
     Args:
         peak_csv_df: Raw peak DataFrame from load_peak_csvs.
-        annotations: Parsed annotation JSON dict.
+        beats_df: ``beats.parquet`` content; rows with ``is_added_peak=True``
+            contribute manually-added peak timestamps.
         recording_start_ns: Epoch ns of recording start (for segment_idx).
 
     Returns:
@@ -1133,43 +844,30 @@ def build_peaks(
             }
         )
 
-    # ── Collect annotation added peaks (manually_added_missed_peaks) ───────
-    added_raw = get_annotation_key(
-        annotations, "manually_added_missed_peaks", "added_r_peaks", default=[]
-    )
-    added_ns = parse_timestamp_list(added_raw)
-    for ts in added_ns:
-        records.append(
-            {
-                "timestamp_ms": int(ts),
-                "source": "added",
-                "is_added_peak": True,
-                "_origin": "annotation",
-            }
-        )
-
-    # ── Collect interpolated replacement peaks (new timestamps) ────────────
-    for item in get_annotation_key(annotations, "interpolated_replacements", default=[]):
-        if isinstance(item, dict):
-            ts_val = item.get("timestamp")
-            if ts_val is not None:
-                ns = parse_timestamp_to_ns(ts_val)
-                if ns is not None:
-                    records.append(
-                        {
-                            "timestamp_ms": int(ns),
-                            "source": "detected",
-                            "is_added_peak": False,
-                            "_origin": "annotation",
-                        }
-                    )
+    # ── Collect added peaks from beats.parquet ─────────────────────────────
+    if (
+        len(beats_df) > 0
+        and "is_added_peak" in beats_df.columns
+        and "timestamp_ms" in beats_df.columns
+    ):
+        added_mask = beats_df["is_added_peak"].fillna(False).astype(bool).values
+        added_ts = beats_df.loc[added_mask, "timestamp_ms"].astype(np.int64).values
+        for ts in added_ts:
+            records.append(
+                {
+                    "timestamp_ms": int(ts),
+                    "source": "added",
+                    "is_added_peak": True,
+                    "_origin": "annotation",
+                }
+            )
 
     # ── Build DataFrame and deduplicate ────────────────────────────────────
     peaks_df = pd.DataFrame(records)
     peaks_df.sort_values("timestamp_ms", inplace=True)
     peaks_df.reset_index(drop=True, inplace=True)
 
-    # Dedup: within 10ms tolerance, keep annotation version (lower _priority)
+    # Dedup: within DEDUP_TOLERANCE_MS, keep annotation row (lower _priority)
     origin_priority = {"annotation": 0, "csv": 1}
     peaks_df["_priority"] = peaks_df["_origin"].map(origin_priority).fillna(1).astype(int)
 
@@ -1183,7 +881,6 @@ def build_peaks(
         while j < len(peaks_df) and (timestamps[j] - timestamps[i]) <= DEDUP_TOLERANCE_MS:
             j += 1
         if j > i + 1:
-            # Cluster of peaks within tolerance — keep the highest-priority one
             cluster_priorities = priorities[i:j]
             best_offset = int(np.argmin(cluster_priorities))
             for k in range(i, j):
@@ -1198,16 +895,13 @@ def build_peaks(
     peaks_df = peaks_df[keep_mask].copy()
     peaks_df.drop(columns=["_origin", "_priority"], inplace=True)
 
-    # Assign segment_idx relative to recording start
     peaks_df["segment_idx"] = (
         (peaks_df["timestamp_ms"] - recording_start_ns) // SEGMENT_DURATION_MS
     ).astype(np.int32)
 
-    # Auto-increment peak_id
     peaks_df.reset_index(drop=True, inplace=True)
     peaks_df.insert(0, "peak_id", np.arange(len(peaks_df), dtype=np.int64))
 
-    # Enforce dtypes
     peaks_df["timestamp_ms"] = peaks_df["timestamp_ms"].astype(np.int64)
     peaks_df["segment_idx"] = peaks_df["segment_idx"].astype(np.int32)
     peaks_df["is_added_peak"] = peaks_df["is_added_peak"].astype(bool)
@@ -1223,41 +917,41 @@ def build_peaks(
 
 def build_labels(
     peaks_df: pd.DataFrame,
-    peak_csv_df: pd.DataFrame,
-    annotations: dict[str, Any],
-    validated_seg_idxs: set[int] | None = None,
+    beats_df: pd.DataFrame,
     bad_region_ranges: list[tuple[int, int, int]] | None = None,
 ) -> pd.DataFrame:
-    """Build beat-level labels with priority-based assignment.
+    """Build beat-level labels by matching pipeline peaks against beats.parquet.
 
-    Label priority (highest wins):
-      1. artifact       — from annotation 'artifacts' + CSV label=1
-      2. interpolated   — from 'flagged_for_interpolation' / 'interpolated_replacements'
-      3. missed_original — from 'manually_added_missed_peaks' / 'added_r_peaks'
-      4. phys_event     — beat within a tagged_physiological_events window
-      5. clean          — default label within reviewed segments
+    Each peak in ``peaks_df`` is matched to its nearest beat in ``beats_df`` by
+    ``timestamp_ms`` within ``ANNOTATION_MATCH_TOLERANCE_MS``. When matched,
+    the canonical label and reviewed flag are inherited from the beat row;
+    unmatched peaks default to ``label="clean"``, ``reviewed=False`` (i.e.
+    they are not training-eligible).
 
-    Also computes:
-      - phys_event_window (bool): True if the beat falls within any physiological
-        event window, regardless of primary label.
-      - reviewed (bool): True if the beat's segment appears in validated_seg_idxs.
-        Only reviewed beats carry ground-truth labels and should be used for
-        model training.  Beats in unreviewed segments default to label='clean'
-        but reviewed=False, and must NOT be used as negative training examples.
-      - in_bad_region (bool): True if the beat's timestamp falls inside any
-        bad_region time window for its segment.  These beats are uninterpretable
-        and must be excluded from model training (but NOT from inference).
+    Label mapping (from ``beats_df.label``):
+      "clean"    → "clean"        (phys_event_window=False)
+      "artifact" → "artifact"     (phys_event_window=False, includes legacy
+                                   interpolation peaks)
+      "physio"   → "phys_event"   (phys_event_window=True)
+
+    Reviewed flag:
+      ``beats.parquet`` is pre-filtered to training-eligible rows only —
+      unreviewed/revisit segments and beats inside bad regions are already
+      excluded by the upstream annotation builder. Therefore
+      ``reviewed = matched_to_beats_parquet AND beat_training_eligible``.
+
+    in_bad_region:
+      Computed here from ``bad_region_ranges`` for downstream observability.
+      Note: beats inside bad regions are already absent from ``beats.parquet``,
+      so they will have ``reviewed=False``; ``in_bad_region`` is set so that
+      callers can distinguish "uninterpretable" from merely "unreviewed".
 
     Args:
         peaks_df: Canonical peaks table (with timestamp_ms and segment_idx).
-        peak_csv_df: Raw peak CSV DataFrame (with peak_id in ms and label).
-        annotations: Parsed annotation JSON dict.
-        validated_seg_idxs: Set of integer segment indices that were manually
-            reviewed.  Pass the result of extract_validated_segment_indices().
-            If None, all beats are marked reviewed=False.
-        bad_region_ranges: List of (pipeline_seg_idx, start_ns, end_ns) tuples
-            from extract_bad_region_time_ranges().  If None, in_bad_region is
-            all False.
+        beats_df: ``beats.parquet`` content (training-eligible beats only).
+        bad_region_ranges: List of (segment_idx, start_ms, end_ms) tuples
+            from extract_bad_region_time_ranges(). If None or empty,
+            ``in_bad_region`` is all False.
 
     Returns:
         DataFrame with columns: peak_id (int64), label (str),
@@ -1266,128 +960,99 @@ def build_labels(
     peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     n_peaks = len(peak_ts)
 
-    # ── Parse annotation timestamp arrays ──────────────────────────────────
-    # Artifacts from annotation JSON
-    annotation_artifact_ns = parse_timestamp_list(
-        get_annotation_key(annotations, "artifacts", default=[])
-    )
+    # ── Match each peak to its nearest beat in beats.parquet ──────────────
+    # Vectorized nearest-neighbour search: for each peak timestamp we look
+    # up the closest beat timestamp; the match is accepted if the distance
+    # is within ANNOTATION_MATCH_TOLERANCE_MS.
+    labels = np.full(n_peaks, "clean", dtype=object)
+    in_phys_window = np.zeros(n_peaks, dtype=bool)
+    is_reviewed = np.zeros(n_peaks, dtype=bool)
+    matched = np.zeros(n_peaks, dtype=bool)
 
-    # Artifacts from CSV label=1
-    csv_artifact_ns = np.array([], dtype=np.int64)
-    if "label" in peak_csv_df.columns and "peak_id" in peak_csv_df.columns:
-        artifact_rows = peak_csv_df[peak_csv_df["label"] == 1]
-        if len(artifact_rows) > 0:
-            csv_artifact_ns = (
-                artifact_rows["peak_id"].values.astype(np.int64)
+    if len(beats_df) > 0 and "timestamp_ms" in beats_df.columns:
+        beats_sorted = beats_df.sort_values("timestamp_ms").reset_index(drop=True)
+        beat_ts = beats_sorted["timestamp_ms"].values.astype(np.int64)
+        beat_label = beats_sorted["label"].astype(str).values
+        if "beat_training_eligible" in beats_sorted.columns:
+            beat_eligible = (
+                beats_sorted["beat_training_eligible"].fillna(False).astype(bool).values
+            )
+        else:
+            beat_eligible = np.ones(len(beats_sorted), dtype=bool)
+
+        # Nearest-neighbour by binary search
+        idx = np.searchsorted(beat_ts, peak_ts, side="left")
+        idx_left = np.clip(idx - 1, 0, len(beat_ts) - 1)
+        idx_right = np.clip(idx, 0, len(beat_ts) - 1)
+        dist_left = np.abs(peak_ts - beat_ts[idx_left])
+        dist_right = np.abs(peak_ts - beat_ts[idx_right])
+        use_left = dist_left <= dist_right
+        nearest_idx = np.where(use_left, idx_left, idx_right)
+        nearest_dist = np.where(use_left, dist_left, dist_right)
+        matched = nearest_dist <= ANNOTATION_MATCH_TOLERANCE_MS
+
+        # Pull labels and eligibility from the matched beat rows
+        matched_beat_label = beat_label[nearest_idx]
+        matched_beat_eligible = beat_eligible[nearest_idx]
+
+        # Apply BEAT_LABEL_MAP only to matched peaks; warn on unknown labels
+        unknown_label_mask = matched & ~np.isin(
+            matched_beat_label, list(BEAT_LABEL_MAP.keys())
+        )
+        if unknown_label_mask.any():
+            unknown_vals = sorted(set(matched_beat_label[unknown_label_mask]))
+            logger.warning(
+                "Encountered %d matched beats with unrecognized label(s) %r — "
+                "treating as 'clean'",
+                int(unknown_label_mask.sum()), unknown_vals,
             )
 
-    all_artifact_ns = np.unique(
-        np.concatenate([annotation_artifact_ns, csv_artifact_ns])
-    )
+        # Translate input labels to canonical labels for matched peaks
+        for src, dst in BEAT_LABEL_MAP.items():
+            mask = matched & (matched_beat_label == src)
+            labels[mask] = dst
+            if dst == "phys_event":
+                in_phys_window[mask] = True
 
-    # Interpolated peaks
-    interp_ns_list: list[int] = []
-    for ts in parse_timestamp_list(
-        get_annotation_key(annotations, "flagged_for_interpolation", default=[])
-    ):
-        interp_ns_list.append(int(ts))
-    for item in get_annotation_key(annotations, "interpolated_replacements", default=[]):
-        if isinstance(item, dict):
-            for field in ("peak_id", "timestamp"):
-                val = item.get(field)
-                if val is not None:
-                    ns = parse_timestamp_to_ns(val)
-                    if ns is not None:
-                        interp_ns_list.append(ns)
-    interp_ns = np.unique(np.array(interp_ns_list, dtype=np.int64))
+        is_reviewed = matched & matched_beat_eligible.astype(bool)
 
-    # Manually added peaks
-    added_ns = parse_timestamp_list(
-        get_annotation_key(
-            annotations, "manually_added_missed_peaks", "added_r_peaks", default=[]
-        )
-    )
-
-    # Physiological event windows
-    phys_events = parse_phys_event_windows(
-        get_annotation_key(annotations, "tagged_physiological_events", default=[])
-    )
-
-    # ── Vectorized matching ────────────────────────────────────────────────
-    # Use ANNOTATION_MATCH_TOLERANCE_MS (80 ms) for all annotation-derived
-    # labels.  Annotation timestamps were recorded against pre-snap peak
-    # positions; the argmax snap shifts peaks up to 60 ms, so the default
-    # 10 ms dedup tolerance would miss ~80 % of valid matches.
-    is_artifact = timestamps_match_with_tolerance(
-        peak_ts, all_artifact_ns, tolerance_ns=ANNOTATION_MATCH_TOLERANCE_MS
-    )
-    is_interp = timestamps_match_with_tolerance(
-        peak_ts, interp_ns, tolerance_ns=ANNOTATION_MATCH_TOLERANCE_MS
-    )
-    is_added = (
-        peaks_df["is_added_peak"].values
-        | timestamps_match_with_tolerance(
-            peak_ts, added_ns, tolerance_ns=ANNOTATION_MATCH_TOLERANCE_MS
-        )
-    )
-
-    # Phys event windows: check if each peak falls within any window
-    in_phys_window = np.zeros(n_peaks, dtype=bool)
-    for start_ns, end_ns in phys_events:
-        in_phys_window |= (peak_ts >= start_ns) & (peak_ts <= end_ns)
-
-    # ── Assign labels: lowest priority first, higher overwrites ────────────
-    labels = np.full(n_peaks, "clean", dtype=object)
-
-    # Priority 4: phys_event (overwrites clean)
-    labels[in_phys_window] = "phys_event"
-
-    # Priority 3: missed_original (overwrites clean + phys_event)
-    labels[is_added] = "missed_original"
-
-    # Priority 2: interpolated (overwrites lower)
-    labels[is_interp] = "interpolated"
-
-    # Priority 1: artifact (overwrites everything)
-    labels[is_artifact] = "artifact"
-
-    # ── Reviewed flag ─────────────────────────────────────────────────────
-    # A beat is "reviewed" only if its segment was manually annotated.
-    # Unreviewed beats should not be used as negative training examples.
-    if validated_seg_idxs is not None:
-        seg_idxs = peaks_df["segment_idx"].values
-        is_reviewed = np.array(
-            [int(s) in validated_seg_idxs for s in seg_idxs], dtype=bool
-        )
-        n_reviewed = int(is_reviewed.sum())
-        n_unreviewed = n_peaks - n_reviewed
+        n_matched = int(matched.sum())
+        n_eligible = int(is_reviewed.sum())
         logger.info(
-            "Reviewed beats: %d  |  Unreviewed (excluded from training): %d",
-            n_reviewed,
-            n_unreviewed,
+            "Matched %d / %d input beats to pipeline peaks (tolerance %d ms); "
+            "%d are training-eligible",
+            n_matched, len(beats_df), ANNOTATION_MATCH_TOLERANCE_MS, n_eligible,
         )
+        # Beats present in beats.parquet but with no nearby pipeline peak
+        # mean the input was built against a different peak detection pass.
+        # Surface this loudly because it indicates stale annotation inputs.
+        unmatched_input = len(beats_df) - n_matched
+        if unmatched_input > 0:
+            logger.warning(
+                "%d input beat row(s) had no pipeline peak within %d ms — "
+                "annotation INPUT may be out of sync with current peaks.parquet",
+                unmatched_input, ANNOTATION_MATCH_TOLERANCE_MS,
+            )
     else:
-        is_reviewed = np.zeros(n_peaks, dtype=bool)
         logger.warning(
-            "No validated_seg_idxs provided — all %d beats marked unreviewed", n_peaks
+            "beats_df is empty — all %d peaks default to label='clean', reviewed=False",
+            n_peaks,
         )
 
-    # ── in_bad_region flag ────────────────────────────────────────────────────
-    # Vectorized: for each (seg_idx, start_ns, end_ns), mask beats in the window.
-    seg_idxs = peaks_df["segment_idx"].values
+    # ── in_bad_region flag (informational; eligibility already handled) ───
     in_bad_region = np.zeros(n_peaks, dtype=bool)
     if bad_region_ranges:
-        for br_seg, br_start, br_end in bad_region_ranges:
-            mask = (
-                (seg_idxs == br_seg)
-                & (peak_ts >= br_start)
-                & (peak_ts <= br_end)
-            )
+        for _ignored_seg, br_start, br_end in bad_region_ranges:
+            # Match by absolute timestamp only — a segment_idx equality check
+            # silently drops legitimate bad regions whenever the pipeline's
+            # recording_start_ns differs from the annotation builder's by even
+            # a millisecond, since beats near a 60-s boundary then fall in a
+            # neighbouring segment_idx.
+            mask = (peak_ts >= br_start) & (peak_ts <= br_end)
             in_bad_region |= mask
-        n_in_bad_region = int(in_bad_region.sum())
         logger.info(
             "Beats inside bad_region windows: %d (in_bad_region=True)",
-            n_in_bad_region,
+            int(in_bad_region.sum()),
         )
 
     result = pd.DataFrame(
@@ -1400,96 +1065,96 @@ def build_labels(
         }
     )
 
-    dist = result["label"].value_counts()
-    logger.info("Label distribution:\n%s", dist.to_string())
+    logger.info(
+        "Label distribution:\n%s", result["label"].value_counts().to_string()
+    )
+    logger.info(
+        "reviewed=True: %d  |  reviewed=False: %d",
+        int(result["reviewed"].sum()), int((~result["reviewed"]).sum()),
+    )
     return result
 
 
 def build_segments(
     seg_ranges: dict[int, tuple[int, int]],
-    peaks_df: pd.DataFrame,
-    labels_df: pd.DataFrame,
-    annotations: dict[str, Any],
+    segments_input_df: pd.DataFrame,
     recording_start_ns: int,
 ) -> pd.DataFrame:
-    """Build segment-level quality labels.
+    """Build segment-level quality labels from the input segments parquet.
 
-    Quality label assignment:
-      - bad: flagged in bad_segments/bad_regions/flagged_poor_quality_segments,
-             OR more than 30% of beats in the segment are labeled 'artifact'
-      - noisy_ok: has at least one artifact beat but not flagged as bad
-      - clean: no artifact beats, no bad flags, at least 10 validated beats
+    The manual segment classification in ``segments.parquet`` is now
+    authoritative. ``segment_quality_label`` is mapped to the canonical
+    ``quality_label`` consumed by ``segment_quality.py``:
+
+      "usable"   → "clean"
+      "partial"  → "noisy_ok"
+      "unusable" → "bad"
+      "unknown"  → "unknown"
+
+    Segments that exist in ECG (``seg_ranges``) but are absent from the input
+    annotation are emitted with ``quality_label="unknown"``.
 
     Args:
-        seg_ranges: Per-segment timestamp ranges, {segment_idx: (min_ns, max_ns)},
-            returned by stream_ecg_to_parquet(). Replaces the ecg_samples DataFrame.
-        peaks_df: Canonical peaks table.
-        labels_df: Canonical labels table.
-        annotations: Parsed annotation JSON dict.
-        recording_start_ns: Epoch ns of recording start.
+        seg_ranges: Per-segment timestamp ranges, {segment_idx: (min_ms, max_ms)},
+            returned by stream_ecg_to_parquet().
+        segments_input_df: ``segments.parquet`` content from the annotation
+            INPUT directory.
+        recording_start_ns: Epoch ms of recording start (used to synthesize a
+            timestamp range when a segment is absent from seg_ranges).
 
     Returns:
         DataFrame with columns: segment_idx (int32), quality_label (str),
         start_timestamp_ms (int64), end_timestamp_ms (int64).
     """
-    # Merge peaks with labels to get per-segment beat statistics
-    peak_labels = peaks_df[["peak_id", "segment_idx"]].merge(
-        labels_df[["peak_id", "label"]], on="peak_id", how="left"
-    )
+    # Build segment_idx → segment_quality_label lookup
+    quality_by_seg: dict[int, str] = {}
+    if len(segments_input_df) > 0 and "segment_quality_label" in segments_input_df.columns:
+        unknown_inputs: set[str] = set()
+        for seg_idx, raw_label in zip(
+            segments_input_df["segment_idx"].astype(np.int64).values,
+            segments_input_df["segment_quality_label"].astype(str).values,
+        ):
+            if raw_label in SEGMENT_QUALITY_MAP:
+                quality_by_seg[int(seg_idx)] = SEGMENT_QUALITY_MAP[raw_label]
+            else:
+                unknown_inputs.add(raw_label)
+                quality_by_seg[int(seg_idx)] = "unknown"
+        if unknown_inputs:
+            logger.warning(
+                "Unrecognized segment_quality_label value(s) %r — mapped to 'unknown'",
+                sorted(unknown_inputs),
+            )
 
-    seg_stats = peak_labels.groupby("segment_idx").agg(
-        total_beats=("peak_id", "count"),
-        artifact_beats=("label", lambda x: (x == "artifact").sum()),
-        clean_beats=("label", lambda x: (x == "clean").sum()),
-    )
-
-    bad_seg_idxs = extract_bad_segment_indices(annotations, recording_start_ns)
-    validated_seg_idxs = extract_validated_segment_indices(annotations, recording_start_ns)
-    all_seg_idxs = sorted(seg_ranges.keys())
+    # Combine ECG-observed segments with annotation-input segment_idxs so
+    # that segments classified manually but with no ECG (rare) still appear.
+    all_seg_idxs = sorted(set(seg_ranges.keys()) | set(quality_by_seg.keys()))
 
     records: list[dict[str, Any]] = []
-    for seg_idx in all_seg_idxs:
-        seg_int = int(seg_idx)
-
-        # Timestamp range from pre-computed dict — no DataFrame needed
+    n_missing_in_ecg = 0
+    for seg_int in all_seg_idxs:
         if seg_int in seg_ranges:
-            start_ns, end_ns = seg_ranges[seg_int]
+            start_ms, end_ms = seg_ranges[seg_int]
         else:
-            start_ns = recording_start_ns + seg_int * SEGMENT_DURATION_MS
-            end_ns = recording_start_ns + (seg_int + 1) * SEGMENT_DURATION_MS
+            n_missing_in_ecg += 1
+            start_ms = recording_start_ns + seg_int * SEGMENT_DURATION_MS
+            end_ms = recording_start_ns + (seg_int + 1) * SEGMENT_DURATION_MS
 
-        # Beat statistics
-        if seg_idx in seg_stats.index:
-            total = int(seg_stats.loc[seg_idx, "total_beats"])
-            n_artifact = int(seg_stats.loc[seg_idx, "artifact_beats"])
-            n_clean = int(seg_stats.loc[seg_idx, "clean_beats"])
-        else:
-            total = 0
-            n_artifact = 0
-            n_clean = 0
-
-        artifact_frac = n_artifact / total if total > 0 else 0.0
-
-        # Quality assignment
-        if seg_int in bad_seg_idxs or artifact_frac > ARTIFACT_FRACTION_BAD:
-            quality = "bad"
-        elif n_artifact > 0:
-            quality = "noisy_ok"
-        elif seg_int in validated_seg_idxs:
-            if n_clean >= MIN_VALIDATED_BEATS_CLEAN:
-                quality = "clean"
-            else:
-                quality = "noisy_ok"
-        else:
-            quality = "unknown"
+        quality = quality_by_seg.get(seg_int, "unknown")
 
         records.append(
             {
                 "segment_idx": np.int32(seg_int),
                 "quality_label": quality,
-                "start_timestamp_ms": np.int64(start_ns),
-                "end_timestamp_ms": np.int64(end_ns),
+                "start_timestamp_ms": np.int64(start_ms),
+                "end_timestamp_ms": np.int64(end_ms),
             }
+        )
+
+    if n_missing_in_ecg > 0:
+        logger.warning(
+            "%d segment_idx values were classified in segments.parquet but "
+            "absent from ECG (synthesized timestamp ranges)",
+            n_missing_in_ecg,
         )
 
     result = pd.DataFrame(records)
@@ -1497,8 +1162,10 @@ def build_segments(
     result["start_timestamp_ms"] = result["start_timestamp_ms"].astype(np.int64)
     result["end_timestamp_ms"] = result["end_timestamp_ms"].astype(np.int64)
 
-    dist = result["quality_label"].value_counts()
-    logger.info("Segment quality distribution:\n%s", dist.to_string())
+    logger.info(
+        "Segment quality distribution:\n%s",
+        result["quality_label"].value_counts().to_string(),
+    )
     return result
 
 
@@ -1694,7 +1361,12 @@ def main() -> None:
         "--annotations",
         type=Path,
         required=True,
-        help="Path to artifact_annotation.json",
+        help=(
+            "Path to the annotation INPUT directory containing beats.parquet, "
+            "segments.parquet, and bad_regions.parquet (e.g. "
+            "Data/Annotations/INPUT/). Legacy artifact_annotation.json is no "
+            "longer accepted."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -1732,15 +1404,9 @@ def main() -> None:
     logger.debug(
         "Config: SEGMENT_DURATION_MS=%d  DEDUP_TOLERANCE_MS=%d  "
         "ANNOTATION_MATCH_TOLERANCE_MS=%d  MIN_VALID_TIMESTAMP_MS=%d  "
-        "ECG_CHUNK_SIZE=%d  ARTIFACT_FRACTION_BAD=%.2f  MIN_VALIDATED_BEATS_CLEAN=%d",
+        "ECG_CHUNK_SIZE=%d",
         SEGMENT_DURATION_MS, DEDUP_TOLERANCE_MS, ANNOTATION_MATCH_TOLERANCE_MS,
-        MIN_VALID_TIMESTAMP_MS, ECG_CHUNK_SIZE, ARTIFACT_FRACTION_BAD, MIN_VALIDATED_BEATS_CLEAN,
-    )
-    logger.debug(
-        "ECG polarity detection: threshold=%.2f  window_sec=%.1f  "
-        "min_windows=%d  sample_step=%d",
-        ECG_INVERSION_THRESHOLD, ECG_INVERSION_WINDOW_SEC,
-        ECG_INVERSION_MIN_WINDOWS, ECG_POLARITY_SAMPLE_STEP,
+        MIN_VALID_TIMESTAMP_MS, ECG_CHUNK_SIZE,
     )
 
     # ── Validate input paths ───────────────────────────────────────────────
@@ -1762,8 +1428,10 @@ def main() -> None:
     print("\n>> Loading peak CSV files...")
     peak_csv_df = load_peak_csvs(args.peaks_dir)
 
-    # ── Load annotations ───────────────────────────────────────────────────
-    annotations = load_annotations(args.annotations)
+    # ── Load annotation parquets (beats, segments, bad_regions) ───────────
+    beats_input_df, segments_input_df, bad_regions_df = load_annotation_inputs(
+        args.annotations
+    )
 
     # ── Stream ECG files → ecg_samples.parquet ────────────────────────────
     # Each file is processed independently; RAM use is bounded to one file
@@ -1780,18 +1448,17 @@ def main() -> None:
 
     # ── Build peaks ────────────────────────────────────────────────────────
     print("\n>> Building peaks table...")
-    peaks = build_peaks(peak_csv_df, annotations, recording_start_ns)
+    peaks = build_peaks(peak_csv_df, beats_input_df, recording_start_ns)
 
     # ── Build labels ───────────────────────────────────────────────────────
     print("\n>> Building labels table...")
-    validated_seg_idxs = extract_validated_segment_indices(annotations, recording_start_ns)
-    bad_region_ranges = extract_bad_region_time_ranges(annotations, recording_start_ns)
-    labels = build_labels(peaks, peak_csv_df, annotations, validated_seg_idxs, bad_region_ranges)
+    bad_region_ranges = extract_bad_region_time_ranges(bad_regions_df)
+    labels = build_labels(peaks, beats_input_df, bad_region_ranges)
 
     # ── Build segments ─────────────────────────────────────────────────────
-    # Uses seg_ranges dict instead of loading ecg_samples.parquet back into RAM.
+    # Manual segment classification from segments.parquet is authoritative.
     print("\n>> Building segments table...")
-    segments = build_segments(seg_ranges, peaks, labels, annotations, recording_start_ns)
+    segments = build_segments(seg_ranges, segments_input_df, recording_start_ns)
 
     # ── Validate referential integrity ─────────────────────────────────────
     print("\n>> Validating referential integrity...")
