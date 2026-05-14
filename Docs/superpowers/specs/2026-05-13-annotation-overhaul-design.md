@@ -109,12 +109,29 @@ Schema:
 
 Mapping rules:
 - `usable` + `segment_rmssd_ms < 50` → `quality_label="clean"`
-- `usable` + `segment_rmssd_ms ≥ 50` → `quality_label="noisy_ok"`
+- `usable` + `50 ≤ segment_rmssd_ms < 250` → `quality_label="unknown"` (RMSSD no-man's-land — discarded from segment training to protect class purity)
+- `usable` + `segment_rmssd_ms ≥ 250` → `quality_label="noisy_ok"`
+- `usable` with insufficient peaks to compute RMSSD (fewer than 3 peaks → 0 successive RR differences) → `quality_label="unknown"`. Expected: <10 segments total.
 - `unclean` → `quality_label="noisy_ok"`
 - `unusable` → `quality_label="bad"`
-- `unknown` → `quality_label="unknown"`
+- `unknown` (input) → `quality_label="unknown"`
 
-Removed columns: `in_revisit_pile`, `has_bad_region`, `bad_region_count`. The two `*_training_eligible` booleans already encode the relevant downstream decisions.
+Expected output class distribution (from user's quick check on the live data):
+- `clean` ≈ 32,000 segments
+- `noisy_ok` ≈ 2,450 segments (the 45 input-`unclean` segments + ~2,400 high-RMSSD `usable` segments)
+- `bad` = 31 segments
+- `unknown` ≈ remainder (36,781 input-`unknown` + ~4,500 RMSSD-purgatory + <10 too-few-peaks)
+
+**Threshold rationale.** The user empirically validated that `segment_rmssd_ms < 50` is conservative enough to keep the `clean` class essentially pure. The `≥ 250` floor for `noisy_ok` is the symmetric conservative choice on the other side — segments above that RMSSD value are almost certainly noisy (real signal even in a POTS patient rarely produces sustained RMSSD that high). The intermediate band is intentionally discarded rather than forced into one side or the other; the cost is ~4,500 segments worth of training data, the benefit is two definitively-pure classes.
+
+### Training-eligibility recomputation
+
+Both eligibility booleans in the output `segments.parquet` are **recomputed from the final `quality_label`**, not just passed through from input:
+
+- `beat_training_eligible_segment` = passes through from input unchanged. Demoting a `usable`-input segment to output `quality_label="unknown"` is purely an RMSSD-driven decision about *segment-level* training; it does not call the underlying beats' trustworthiness into question. The beats inside such a segment remain eligible for beat-level training.
+- `segment_quality_training_eligible` = `True` iff output `quality_label ∈ {clean, noisy_ok, bad}`, else `False`. This means input-`usable` segments that land in the RMSSD no-man's-land get this flag flipped to `False` even though their input flag was `True`.
+
+Removed columns: `in_revisit_pile`, `has_bad_region`, `bad_region_count`. The two `*_training_eligible` booleans (now properly recomputed) already encode the relevant downstream decisions.
 
 ---
 
@@ -122,11 +139,11 @@ Removed columns: `in_revisit_pile`, `has_bad_region`, `bad_region_count`. The tw
 
 For each segment, gather all `peak_id`s in `peaks.parquet` whose timestamp falls within `[start_ms, end_ms]`. Sort by timestamp. Compute successive RR intervals (`diff(timestamp_ms)`). RMSSD is the square root of the mean of squared successive differences of *those* RR intervals.
 
-If a segment has fewer than 3 peaks (so fewer than 2 RR intervals, so fewer than 1 successive difference), set `segment_rmssd_ms = NaN` and fall back to `quality_label="noisy_ok"` for any `usable` segment in that case. Rare edge case; preserves the conservative bias.
+If a segment has fewer than 3 peaks (so fewer than 2 RR intervals, so fewer than 1 successive difference), set `segment_rmssd_ms = NaN` and the segment is discarded — `quality_label="unknown"` with `segment_quality_training_eligible=False`. Expected to affect fewer than 10 segments total.
 
 This is a one-pass computation slotted into `build_segments()` in `data_pipeline.py`.
 
-**Open knob:** computing RMSSD over *all* auto-detected peaks (including artifacts) versus only clean+physio peaks. Defaulting to **all peaks** — simpler, no label dependency, and a segment whose auto-detection produced spurious peaks will correctly fall out of `clean` due to inflated RMSSD. If empirical results suggest this is too aggressive, the rule can be revisited.
+**Closed knob:** computing RMSSD over *all* auto-detected peaks (including artifacts) versus only clean+physio peaks. Locked to **all peaks** — simpler, no label dependency, and a segment whose auto-detection produced spurious peaks will correctly fall out of `clean` due to inflated RMSSD. Revisitable if empirical results suggest the rule is too aggressive.
 
 ---
 
@@ -174,12 +191,17 @@ Also explicitly out of scope: deployment-time cleanup logic that distinguishes s
 
 ---
 
+## Operational notes
+
+- **Parallelism.** Any script that supports a worker / process count flag is run with **12 cores** by default. Drop to no fewer than **9 cores** if and only if real memory pressure is observed during the run. Do not silently reduce parallelism below 9.
+
 ## Validation plan
 
-1. **Schema check** — dry-run `load_annotation_inputs()` against the new INPUT directory. Confirm row counts: ~187k beats, ~40k segments, 52 bad regions.
+1. **Schema check** — dry-run `load_annotation_inputs()` against the new INPUT directory. Row counts are not pinned in this spec because the underlying annotation set is still evolving (e.g., bad_regions has grown from 52 to ~97 since this spec was drafted); the check verifies *column shape and value vocabularies*, not exact counts.
 2. **End-to-end build** — run the full `data_pipeline.py` against the new annotations + ECG/peak CSV inputs. Confirm:
    - `labels.parquet` contains a populated `subtype` column with the expected value distribution.
-   - `segments.parquet` output contains `segment_rmssd_ms` and `quality_label` with a sane class distribution (expect ~half the 3,437 usable segments to become `clean`; the rest `noisy_ok`).
+   - `segments.parquet` output contains `segment_rmssd_ms` and `quality_label` with the expected class distribution (clean ≈ 32k, noisy_ok ≈ 2.5k, bad = 31, unknown = remainder including ~4.5k RMSSD-purgatory segments).
+   - `segment_quality_training_eligible` is `False` on every output `quality_label="unknown"` row.
    - All legacy columns absent.
 3. **Label-flow sanity** — for a random sample of 50 beats from each label class in `beats.parquet`, confirm they map to the correct `(label, subtype, reviewed)` triple in `labels.parquet`.
 4. **Retrain both artifact models** — confirm interpolate beats are present in the training set (no exclusion log line). Compare confusion matrix and per-subtype recall against the previous run; in particular, check whether the 101 interpolate beats now register as recalled positives.
