@@ -53,7 +53,6 @@ def _load_reviewed_with_seg_features(
     keep = labels["reviewed"] | (labels["label"] == "artifact")
     reviewed = labels[keep].copy()
     reviewed["target"] = (reviewed["label"] == "artifact").astype(int)
-    reviewed = reviewed[reviewed["label"] != "interpolated"]
 
     # Join segment_idx
     merged = reviewed.merge(peaks, on="peak_id", how="inner")

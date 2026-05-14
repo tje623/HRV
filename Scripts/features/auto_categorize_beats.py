@@ -48,10 +48,16 @@ import joblib
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
+from sklearn.metrics import average_precision_score, confusion_matrix, roc_auc_score
+from sklearn.tree import DecisionTreeClassifier, export_text
+
+logger = logging.getLogger("ecgclean.auto_categorize_beats")
 
 
 class _NpEncoder(json.JSONEncoder):
     """JSON encoder that handles numpy scalar types."""
+
     def default(self, obj):
         if isinstance(obj, np.integer):
             return int(obj)
@@ -60,14 +66,9 @@ class _NpEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
-import pyarrow.parquet as pq
-from sklearn.metrics import average_precision_score, confusion_matrix, roc_auc_score
-from sklearn.tree import DecisionTreeClassifier, export_text
-
-logger = logging.getLogger("ecgclean.auto_categorize_beats")
 
 # ── Label vocabulary ──────────────────────────────────────────────────────────
-CLEAN_REAL_LABELS = frozenset({"clean", "missed_original", "interpolated", "phys_event"})
+CLEAN_REAL_LABELS = frozenset({"clean", "missed_original", "phys_event"})
 ARTIFACT_LABEL    = "artifact"
 
 # ── Category constants ────────────────────────────────────────────────────────

@@ -25,8 +25,7 @@ def load_reviewed_with_preds(preds_path: Path) -> pd.DataFrame:
     if preds.index.name == "peak_id":
         preds = preds.reset_index()
 
-    keep = (labels["reviewed"] | (labels["label"] == "artifact")) & \
-           (labels["label"] != "interpolated")
+    keep = labels["reviewed"] | (labels["label"] == "artifact")
     reviewed = labels[keep].copy()
     reviewed["target"] = (reviewed["label"] == "artifact").astype(int)
 
