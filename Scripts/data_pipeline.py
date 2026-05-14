@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -394,6 +395,64 @@ SEGMENT_QUALITY_MAP: dict[str, str] = {
     "unusable": "bad",
     "unknown": "unknown",
 }
+
+
+# RMSSD trinary banding for `usable` segments. The "clean" cutoff is
+# deliberately conservative — the user empirically validated that <50 ms
+# does not let noisy segments leak into the clean pool. The "noisy_ok"
+# floor of 250 ms is the symmetric conservative choice on the other
+# side. The middle band is intentionally discarded into "unknown" to
+# protect class purity at both ends.
+SEGMENT_RMSSD_CLEAN_MAX_MS: float = 50.0
+SEGMENT_RMSSD_NOISY_MIN_MS: float = 250.0
+
+
+def compute_segment_rmssd(peaks_df: pd.DataFrame) -> dict[int, float]:
+    """Return {segment_idx → RMSSD in ms} computed over all peaks per segment.
+
+    RMSSD is computed from the auto-detected peak series (post-dedup) as
+    sqrt(mean(diff(RR)^2)), where RR_i = timestamp_ms[i+1] - timestamp_ms[i].
+    A segment with fewer than 3 peaks (so fewer than 2 RR intervals and
+    thus zero successive differences) gets NaN.
+
+    No label filtering: artifact and clean peaks alike act as anchors,
+    consistent with the design decision to keep RMSSD computation
+    label-independent.
+    """
+    out: dict[int, float] = {}
+    if len(peaks_df) == 0:
+        return out
+    for seg_idx, group in peaks_df.groupby("segment_idx"):
+        seg_int = int(seg_idx)
+        if len(group) < 3:
+            out[seg_int] = float("nan")
+            continue
+        ts = np.sort(group["timestamp_ms"].to_numpy().astype(np.int64))
+        rr = np.diff(ts).astype(np.float64)
+        succ_diffs = np.diff(rr)
+        if succ_diffs.size == 0:
+            out[seg_int] = float("nan")
+            continue
+        out[seg_int] = float(np.sqrt(np.mean(succ_diffs ** 2)))
+    return out
+
+
+def classify_usable_segment_quality(rmssd_ms: float) -> str:
+    """Map a `usable`-input segment's RMSSD to its output quality_label.
+
+    - RMSSD < SEGMENT_RMSSD_CLEAN_MAX_MS (50)        → "clean"
+    - SEGMENT_RMSSD_CLEAN_MAX_MS ≤ RMSSD <
+      SEGMENT_RMSSD_NOISY_MIN_MS (250)               → "unknown" (discarded)
+    - RMSSD ≥ SEGMENT_RMSSD_NOISY_MIN_MS (250)       → "noisy_ok"
+    - NaN (insufficient peaks)                       → "unknown" (discarded)
+    """
+    if rmssd_ms is None or (isinstance(rmssd_ms, float) and math.isnan(rmssd_ms)):
+        return "unknown"
+    if rmssd_ms < SEGMENT_RMSSD_CLEAN_MAX_MS:
+        return "clean"
+    if rmssd_ms >= SEGMENT_RMSSD_NOISY_MIN_MS:
+        return "noisy_ok"
+    return "unknown"
 
 
 def extract_bad_region_time_ranges(
