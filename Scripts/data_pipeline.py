@@ -15,29 +15,36 @@ stages:
 Annotation input contract (``--annotations`` is a directory):
 
   beats.parquet
-    timestamp_ms (int64), segment_idx (int32), label (str: clean | artifact |
-    physio), original_annotation (str), is_added_peak (bool),
-    beat_training_eligible (bool). Scope: training-eligible beats only —
-    beats from unreviewed/revisit/bad/bad-region segments are pre-excluded.
+    Columns: timestamp_ms (int64), segment_idx (int32), label
+    (clean | artifact | physio), subtype (auto | added | manual |
+    spurious | interpolate), beat_training_eligible (bool).
+    Scope: training-eligible beats only — beats from unreviewed
+    or bad-region time windows are pre-excluded upstream.
 
   segments.parquet
-    segment_idx, start_ms, end_ms, review_status (reviewed | revisit |
-    unreviewed), segment_quality_label (usable | partial | unusable |
-    unknown), in_revisit_pile, has_bad_region, bad_region_count,
-    beat_training_eligible_segment, segment_quality_training_eligible.
+    Columns: segment_idx (int32), start_ms, end_ms,
+    review_status (reviewed | unreviewed),
+    segment_quality_label (usable | unclean | unusable | unknown),
+    beat_training_eligible_segment (bool),
+    segment_quality_training_eligible (bool).
 
   bad_regions.parquet
-    segment_idx, region_idx_within_segment, start_ms, end_ms,
-    original_annotation. Each row is a bad time interval inside an
-    otherwise-usable segment.
+    Columns: segment_idx, start_ms, end_ms. Each row is a bad
+    time interval inside an otherwise-usable segment.
 
-Label mapping into the canonical tables:
-  beats.label "clean"    → labels.label "clean",    phys_event_window=False
-  beats.label "artifact" → labels.label "artifact", phys_event_window=False
-  beats.label "physio"   → labels.label "phys_event", phys_event_window=True
-  Peaks not present in beats.parquet → label "unknown", reviewed=False
-  segment_quality_label "usable"   → quality_label "clean"
-  segment_quality_label "partial"  → quality_label "noisy_ok"
+Beat label mapping (beats.parquet → labels.parquet):
+  beats.label "clean"    → labels.label "clean"
+  beats.label "artifact" → labels.label "artifact"  (subtype carries
+                                                     spurious vs interpolate)
+  beats.label "physio"   → labels.label "phys_event"
+  Peaks not present in beats.parquet → label "unknown", subtype "",
+  reviewed=False.
+
+Segment quality mapping (segments.parquet → segments.parquet output):
+  segment_quality_label "usable"   + RMSSD < 50  → quality_label "clean"
+  segment_quality_label "usable"   + 50 ≤ RMSSD < 250 → quality_label "unknown"
+  segment_quality_label "usable"   + RMSSD ≥ 250 → quality_label "noisy_ok"
+  segment_quality_label "unclean"  → quality_label "noisy_ok"
   segment_quality_label "unusable" → quality_label "bad"
   segment_quality_label "unknown"  → quality_label "unknown"
 
@@ -832,21 +839,34 @@ def load_annotation_inputs(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load the three annotation parquet files from the input directory.
 
-    Expects ``annotations_path`` to be a directory containing:
-      - beats.parquet        (beat-level labels, training-eligible only)
-      - segments.parquet     (segment-level review status + quality)
-      - bad_regions.parquet  (bad time intervals inside otherwise-usable segments)
+    Expects ``annotations_path`` to be a directory containing exactly:
+      - beats.parquet
+          Columns: timestamp_ms, segment_idx, label, subtype,
+          beat_training_eligible.
+          `label` ∈ {clean, artifact, physio}.
+          `subtype` ∈ {auto, added, manual, spurious, interpolate}.
+      - segments.parquet
+          Columns: segment_idx, start_ms, end_ms, review_status,
+          segment_quality_label, beat_training_eligible_segment,
+          segment_quality_training_eligible.
+          `review_status` ∈ {reviewed, unreviewed}.
+          `segment_quality_label` ∈ {usable, unclean, unusable, unknown}.
+      - bad_regions.parquet
+          Columns: segment_idx, start_ms, end_ms.
 
-    The legacy ``artifact_annotation.json`` is no longer accepted: passing a
-    JSON path raises a SystemExit so misuses fail loudly instead of silently
-    re-introducing the legacy V1 ``validated_segments`` mismatch.
+    The pipeline fails loudly (SystemExit) on any deviation from these
+    schemas. No silent fallback to legacy columns or values.
+
+    The legacy artifact_annotation.json input is rejected; pass a
+    directory containing the three parquets instead.
 
     Args:
         annotations_path: Path to the annotation INPUT directory.
 
     Returns:
-        ``(beats_df, segments_df, bad_regions_df)``. If the directory is
-        absent, all three are empty DataFrames with the expected columns.
+        ``(beats_df, segments_df, bad_regions_df)``. If the directory
+        does not exist, all three are empty DataFrames with the expected
+        columns (preserves the historical "no annotations yet" path).
     """
     if annotations_path.is_file() and annotations_path.suffix.lower() == ".json":
         raise SystemExit(
@@ -856,20 +876,18 @@ def load_annotation_inputs(
             f"bad_regions.parquet (e.g. Data/Annotations/INPUT/)."
         )
 
-    beats_cols = [
-        "timestamp_ms", "segment_idx", "label", "original_annotation",
-        "is_added_peak", "beat_training_eligible",
-    ]
+    beats_cols = ["timestamp_ms", "segment_idx", "label", "subtype", "beat_training_eligible"]
     seg_cols = [
         "segment_idx", "start_ms", "end_ms", "review_status",
-        "segment_quality_label", "in_revisit_pile", "has_bad_region",
-        "bad_region_count", "beat_training_eligible_segment",
+        "segment_quality_label", "beat_training_eligible_segment",
         "segment_quality_training_eligible",
     ]
-    br_cols = [
-        "segment_idx", "region_idx_within_segment", "start_ms", "end_ms",
-        "original_annotation",
-    ]
+    br_cols = ["segment_idx", "start_ms", "end_ms"]
+
+    allowed_review_status = {"reviewed", "unreviewed"}
+    allowed_quality_label = {"usable", "unclean", "unusable", "unknown"}
+    allowed_beat_label = {"clean", "artifact", "physio"}
+    allowed_subtype = {"auto", "added", "manual", "spurious", "interpolate"}
 
     if not annotations_path.is_dir():
         logger.warning(
@@ -898,19 +916,59 @@ def load_annotation_inputs(
     segments_df = pd.read_parquet(segs_path)
     bad_regions_df = pd.read_parquet(br_path)
 
+    def _check_columns(name: str, df: pd.DataFrame, expected: list[str]) -> None:
+        got = set(df.columns)
+        exp = set(expected)
+        missing_cols = exp - got
+        extra_cols = got - exp
+        if missing_cols or extra_cols:
+            raise SystemExit(
+                f"{name} schema mismatch. "
+                f"Missing columns: {sorted(missing_cols) or 'none'}. "
+                f"Unexpected columns: {sorted(extra_cols) or 'none'}. "
+                f"Expected exactly: {sorted(exp)}."
+            )
+
+    _check_columns("beats.parquet", beats_df, beats_cols)
+    _check_columns("segments.parquet", segments_df, seg_cols)
+    _check_columns("bad_regions.parquet", bad_regions_df, br_cols)
+
+    def _check_vocab(name: str, col: str, series: pd.Series, allowed: set[str]) -> None:
+        if len(series) == 0:
+            return
+        actual = set(series.dropna().astype(str).unique())
+        bad = actual - allowed
+        if bad:
+            raise SystemExit(
+                f"{name}: column '{col}' contains unexpected value(s) "
+                f"{sorted(bad)}. Allowed: {sorted(allowed)}."
+            )
+
+    _check_vocab("beats.parquet", "label", beats_df["label"], allowed_beat_label)
+    _check_vocab("beats.parquet", "subtype", beats_df["subtype"], allowed_subtype)
+    _check_vocab(
+        "segments.parquet", "review_status",
+        segments_df["review_status"], allowed_review_status,
+    )
+    _check_vocab(
+        "segments.parquet", "segment_quality_label",
+        segments_df["segment_quality_label"], allowed_quality_label,
+    )
+
     logger.info(
         "Loaded annotations from %s: %d beats, %d segments, %d bad_regions",
         annotations_path, len(beats_df), len(segments_df), len(bad_regions_df),
     )
-
-    # Surface input label distributions so the pipeline log captures what was
-    # consumed (helps detect stale or partially-rebuilt inputs).
-    if len(beats_df) > 0 and "label" in beats_df.columns:
+    if len(beats_df) > 0:
         logger.info(
             "Input beat label distribution: %s",
             beats_df["label"].value_counts().to_dict(),
         )
-    if len(segments_df) > 0 and "segment_quality_label" in segments_df.columns:
+        logger.info(
+            "Input beat subtype distribution: %s",
+            beats_df["subtype"].value_counts().to_dict(),
+        )
+    if len(segments_df) > 0:
         logger.info(
             "Input segment_quality_label distribution: %s",
             segments_df["segment_quality_label"].value_counts().to_dict(),
