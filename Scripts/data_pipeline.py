@@ -1467,101 +1467,80 @@ def build_labels(
 def build_segments(
     seg_ranges: dict[int, tuple[int, int]],
     segments_input_df: pd.DataFrame,
+    peaks_df: pd.DataFrame,
     recording_start_ns: int,
     diagnostics_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Build segment-level quality labels from the input segments parquet.
 
-    The manual segment classification in ``segments.parquet`` is now
-    authoritative. ``segment_quality_label`` is mapped to the canonical
-    ``quality_label`` consumed by ``segment_quality.py``:
+    Output columns:
+      segment_idx (int32)
+      start_timestamp_ms, end_timestamp_ms (int64)
+      review_status ∈ {reviewed, unreviewed}
+      quality_label ∈ {clean, noisy_ok, bad, unknown}
+      segment_rmssd_ms (float32, NaN when <3 peaks)
+      beat_training_eligible_segment (bool, passes through from input)
+      segment_quality_training_eligible (bool, recomputed from final
+        quality_label)
 
-      "usable"   → "clean"
-      "partial"  → "noisy_ok"
-      "unusable" → "bad"
-      "unknown"  → "unknown"
+    Mapping rules:
+      usable + RMSSD < 50           → clean
+      usable + 50 ≤ RMSSD < 250     → unknown (RMSSD purgatory; discarded)
+      usable + RMSSD ≥ 250          → noisy_ok
+      usable + RMSSD NaN            → unknown
+      unclean                       → noisy_ok
+      unusable                      → bad
+      unknown (input)               → unknown
 
-    Segments that exist in ECG (``seg_ranges``) but are absent from the input
-    annotation are emitted with ``quality_label="unknown"``. Annotation
-    ``segment_idx`` values are treated as GUI/input ordinals; mapping to
-    canonical pipeline ``segment_idx`` is done by absolute ``start_ms`` /
-    ``end_ms`` overlap.
+    segment_quality_training_eligible is True iff the OUTPUT
+    quality_label is in {clean, noisy_ok, bad}. beat_training_eligible_segment
+    is passed through unchanged from the input — the RMSSD-driven
+    demotion to `unknown` is purely a segment-level concern.
 
-    Args:
-        seg_ranges: Per-segment timestamp ranges, {segment_idx: (min_ms, max_ms)},
-            returned by stream_ecg_to_parquet().
-        segments_input_df: ``segments.parquet`` content from the annotation
-            INPUT directory.
-        recording_start_ns: Epoch ms of recording start, used to translate
-            annotation start/end timestamps into canonical pipeline segment_idx.
-        diagnostics_dir: Optional directory for annotation/segment mapping CSVs.
-
-    Returns:
-        DataFrame with columns: segment_idx (int32), quality_label (str),
-        start_timestamp_ms (int64), end_timestamp_ms (int64).
+    The input segments_input_df uses a GUI ordinal `segment_idx` while the
+    pipeline's seg_ranges keys are wall-clock segment ordinals; matching is
+    done by timestamp overlap, not raw id equality.
     """
-    # Build pipeline segment_idx -> segment quality by timestamp overlap.
-    # The annotation input's segment_idx is a compact GUI ordinal over recorded
-    # windows, while ecg_samples.segment_idx is a wall-clock bin from
-    # recording_start_ns. Comparing those raw IDs directly is a namespace bug.
+    rmssd_by_pipe_seg = compute_segment_rmssd(peaks_df)
+
     quality_by_seg: dict[int, str] = {}
     overlap_by_seg: dict[int, int] = {}
     priority_by_quality = {"unknown": 0, "clean": 1, "noisy_ok": 2, "bad": 3}
     mapping_records: list[dict[str, Any]] = []
 
-    if len(segments_input_df) > 0 and "segment_quality_label" in segments_input_df.columns:
-        unknown_inputs: set[str] = set()
-        required_cols = {"segment_idx", "start_ms", "end_ms", "segment_quality_label"}
-        missing_cols = required_cols - set(segments_input_df.columns)
-        if missing_cols:
-            raise ValueError(
-                f"segments.parquet is missing required column(s): {sorted(missing_cols)}"
-            )
-
+    if len(segments_input_df) > 0:
         for row in segments_input_df.itertuples(index=False):
             input_seg_idx = int(getattr(row, "segment_idx"))
             start_ms = int(getattr(row, "start_ms"))
             end_ms = int(getattr(row, "end_ms"))
             raw_label = str(getattr(row, "segment_quality_label"))
-            if raw_label in SEGMENT_QUALITY_MAP:
-                quality = SEGMENT_QUALITY_MAP[raw_label]
-            else:
-                unknown_inputs.add(raw_label)
-                quality = "unknown"
+            review_status = str(getattr(row, "review_status", ""))
 
             wall_start_seg = int((start_ms - recording_start_ns) // SEGMENT_DURATION_MS)
             wall_end_seg = int(
                 (max(start_ms, end_ms - 1) - recording_start_ns) // SEGMENT_DURATION_MS
             )
-            candidate_segments = range(wall_start_seg, wall_end_seg + 1)
             best_pipe_seg: int | None = None
             max_overlap = 0
-
-            for pipe_seg in candidate_segments:
+            for pipe_seg in range(wall_start_seg, wall_end_seg + 1):
                 pipe_start = recording_start_ns + pipe_seg * SEGMENT_DURATION_MS
                 pipe_end = recording_start_ns + (pipe_seg + 1) * SEGMENT_DURATION_MS
                 overlap = max(0, min(end_ms, pipe_end) - max(start_ms, pipe_start))
                 if overlap <= 0 or pipe_seg not in seg_ranges:
                     continue
-
                 if overlap > max_overlap:
                     best_pipe_seg = pipe_seg
                     max_overlap = int(overlap)
 
-            review_status = str(getattr(row, "review_status", ""))
-            segment_quality_training_eligible = (
-                boolish(getattr(row, "segment_quality_training_eligible"))
-                if hasattr(row, "segment_quality_training_eligible")
-                else review_status != "revisit"
-            )
-            applies_to_training_label = (
-                best_pipe_seg is not None
-                and segment_quality_training_eligible
-                and review_status != "revisit"
-                and raw_label in {"usable", "partial", "unusable"}
-            )
+            if raw_label == "usable":
+                rmssd = rmssd_by_pipe_seg.get(best_pipe_seg, float("nan"))
+                quality = classify_usable_segment_quality(rmssd)
+            else:
+                quality = SEGMENT_QUALITY_MAP.get(raw_label, "unknown")
+
+            applies = best_pipe_seg is not None and quality != "unknown"
             applied_pipe_seg: int | None = None
-            if applies_to_training_label:
+            if applies:
                 old_overlap = overlap_by_seg.get(best_pipe_seg, -1)
                 old_quality = quality_by_seg.get(best_pipe_seg, "unknown")
                 should_replace = max_overlap > old_overlap or (
@@ -1570,107 +1549,87 @@ def build_segments(
                 )
                 if should_replace:
                     quality_by_seg[best_pipe_seg] = quality
-                    overlap_by_seg[best_pipe_seg] = int(max_overlap)
+                    overlap_by_seg[best_pipe_seg] = max_overlap
                 applied_pipe_seg = best_pipe_seg
 
-            record = {
+            mapping_records.append({
                 "input_segment_idx": input_seg_idx,
                 "start_ms": start_ms,
-                "start_iso": timestamp_ms_to_iso(start_ms),
-                "start_local": timestamp_ms_to_local_display(start_ms),
                 "end_ms": end_ms,
-                "end_iso": timestamp_ms_to_iso(end_ms),
-                "end_local": timestamp_ms_to_local_display(end_ms),
                 "review_status": review_status,
-                "segment_quality_training_eligible": segment_quality_training_eligible,
                 "raw_segment_quality_label": raw_label,
                 "canonical_quality_label": quality,
-                "wall_start_segment_idx": wall_start_seg,
-                "wall_end_segment_idx": wall_end_seg,
-                "raw_segment_idx_exists_in_ecg": input_seg_idx in seg_ranges,
-                "overlaps_ecg_by_time": best_pipe_seg is not None,
                 "best_pipeline_segment_idx": best_pipe_seg,
                 "best_overlap_ms": max_overlap,
-                "applied_to_training_label": applies_to_training_label,
                 "applied_pipeline_segment_idx": applied_pipe_seg,
-            }
-            mapping_records.append(record)
-
-        if unknown_inputs:
-            logger.warning(
-                "Unrecognized segment_quality_label value(s) %r — mapped to 'unknown'",
-                sorted(unknown_inputs),
-            )
-
-        mapping_df = pd.DataFrame(mapping_records)
-        raw_absent = mapping_df[~mapping_df["raw_segment_idx_exists_in_ecg"]].copy()
-        no_time_overlap = mapping_df[~mapping_df["overlaps_ecg_by_time"]].copy()
-
-        n_raw_absent = len(raw_absent)
-        if n_raw_absent > 0:
-            logger.warning(
-                "%d annotation segment_idx value(s) are absent from ECG by raw ID. "
-                "These are GUI/input ordinals, not canonical ECG segment_idx values; "
-                "segment labels are mapped by timestamp overlap instead.",
-                n_raw_absent,
-            )
-        if len(no_time_overlap) > 0:
-            logger.warning(
-                "%d annotation segment row(s) had no ECG overlap by timestamp",
-                len(no_time_overlap),
-            )
+            })
 
         if diagnostics_dir is not None:
-            write_csv(mapping_df, diagnostics_dir / "annotation_segment_index_mapping.csv")
-            if n_raw_absent > 0:
-                write_csv(
-                    raw_absent,
-                    diagnostics_dir / "annotation_raw_segment_idx_absent_from_ecg.csv",
-                )
-                write_csv(
-                    collapse_segment_diagnostic_ranges(raw_absent),
-                    diagnostics_dir / "annotation_raw_segment_idx_absent_ranges.csv",
-                )
             write_csv(
-                no_time_overlap,
-                diagnostics_dir / "annotation_segments_without_ecg_overlap.csv",
+                pd.DataFrame(mapping_records),
+                diagnostics_dir / "annotation_segment_index_mapping.csv",
             )
-            if len(no_time_overlap) > 0:
-                write_csv(
-                    collapse_segment_diagnostic_ranges(no_time_overlap),
-                    diagnostics_dir / "annotation_segments_without_ecg_overlap_ranges.csv",
-                )
 
-    all_seg_idxs = sorted(seg_ranges.keys())
+    btes_by_seg: dict[int, bool] = {}
+    review_by_seg: dict[int, str] = {}
+    if len(segments_input_df) > 0 and "beat_training_eligible_segment" in segments_input_df.columns:
+        for rec in mapping_records:
+            pipe_seg = rec["best_pipeline_segment_idx"]
+            if pipe_seg is None:
+                continue
+            input_idx = rec["input_segment_idx"]
+            input_row = segments_input_df.loc[
+                segments_input_df["segment_idx"] == input_idx
+            ]
+            if len(input_row) > 0:
+                btes_by_seg[pipe_seg] = bool(
+                    input_row["beat_training_eligible_segment"].iloc[0]
+                )
+            review_by_seg[pipe_seg] = rec["review_status"]
 
     records: list[dict[str, Any]] = []
-    n_missing_in_ecg = 0
-    for seg_int in all_seg_idxs:
+    for seg_int in sorted(seg_ranges.keys()):
         start_ms, end_ms = seg_ranges[seg_int]
-
         quality = quality_by_seg.get(seg_int, "unknown")
+        rmssd = rmssd_by_pipe_seg.get(seg_int, float("nan"))
+        beat_eligible = btes_by_seg.get(seg_int, False)
+        sq_eligible = quality in {"clean", "noisy_ok", "bad"}
+        review = review_by_seg.get(seg_int, "unreviewed")
 
-        records.append(
-            {
-                "segment_idx": np.int32(seg_int),
-                "quality_label": quality,
-                "start_timestamp_ms": np.int64(start_ms),
-                "end_timestamp_ms": np.int64(end_ms),
-            }
-        )
-
-    if n_missing_in_ecg > 0:
-        logger.warning("%d segment rows were synthesized without ECG", n_missing_in_ecg)
+        records.append({
+            "segment_idx": np.int32(seg_int),
+            "start_timestamp_ms": np.int64(start_ms),
+            "end_timestamp_ms": np.int64(end_ms),
+            "review_status": review,
+            "quality_label": quality,
+            "segment_rmssd_ms": np.float32(rmssd),
+            "beat_training_eligible_segment": bool(beat_eligible),
+            "segment_quality_training_eligible": bool(sq_eligible),
+        })
 
     result = pd.DataFrame(records)
     result["segment_idx"] = result["segment_idx"].astype(np.int32)
     result["start_timestamp_ms"] = result["start_timestamp_ms"].astype(np.int64)
     result["end_timestamp_ms"] = result["end_timestamp_ms"].astype(np.int64)
+    result["segment_rmssd_ms"] = result["segment_rmssd_ms"].astype(np.float32)
+    result["beat_training_eligible_segment"] = result["beat_training_eligible_segment"].astype(bool)
+    result["segment_quality_training_eligible"] = result["segment_quality_training_eligible"].astype(bool)
 
     logger.info(
         "Segment quality distribution:\n%s",
         result["quality_label"].value_counts().to_string(),
     )
+    if "segment_rmssd_ms" in result.columns:
+        purg_mask = (
+            (result["quality_label"] == "unknown")
+            & (~result["segment_rmssd_ms"].isna())
+            & (result["segment_rmssd_ms"] >= SEGMENT_RMSSD_CLEAN_MAX_MS)
+            & (result["segment_rmssd_ms"] < SEGMENT_RMSSD_NOISY_MIN_MS)
+        )
+        logger.info(
+            "RMSSD purgatory segments (50 ≤ RMSSD < 250 + usable): %d",
+            int(purg_mask.sum()),
+        )
     return result
 
 
@@ -1975,7 +1934,13 @@ def main() -> None:
     # ── Build segments ─────────────────────────────────────────────────────
     # Manual segment classification from segments.parquet is authoritative.
     print("\n>> Building segments table...")
-    segments = build_segments(seg_ranges, segments_input_df, recording_start_ns, diagnostics_dir)
+    segments = build_segments(
+        seg_ranges=seg_ranges,
+        segments_input_df=segments_input_df,
+        peaks_df=peaks,
+        recording_start_ns=recording_start_ns,
+        diagnostics_dir=diagnostics_dir,
+    )
 
     # ── Validate referential integrity ─────────────────────────────────────
     print("\n>> Validating referential integrity...")
