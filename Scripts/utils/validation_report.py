@@ -71,6 +71,17 @@ def report_model(label: str, merged: pd.DataFrame, prob_col: str,
     print(f"  Confusion matrix (threshold={threshold:.4f}):")
     print(f"    TN={tn:,}  FP={fp:,}")
     print(f"    FN={fn:,}  TP={tp:,}")
+    # ── Subtype-stratified artifact recall ───────────────────────────────
+    if "subtype" in merged.columns:
+        print(f"  Recall by subtype (threshold={threshold:.4f}):")
+        for st in ("spurious", "interpolate"):
+            mask = (merged["label"].values == "artifact") & (merged["subtype"].values == st)
+            n = int(mask.sum())
+            if n == 0:
+                print(f"    {st:>11}: 0 examples")
+                continue
+            tp_st = int(y_pred[mask].sum())
+            print(f"    {st:>11}: {tp_st} / {n} = {tp_st/n:.3f}")
     prob_distribution_bins(p)
 
     return {"pr_auc": pr_auc, "roc_auc": roc_auc, "precision": precision,

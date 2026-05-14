@@ -231,6 +231,23 @@ def main() -> None:
         lgbm_pr_auc = float("nan")
         lgbm_roc_auc = float("nan")
 
+    # ── Subtype-stratified artifact recall (binary thresholded preds) ─────
+    # Reports recall separately for `spurious` and `interpolate` so the
+    # 101 interpolate artifacts are observable rather than averaged into
+    # the ~10k spurious. val_df carries `subtype` from labels.parquet.
+    if "subtype" in val_df.columns and valid_mask.sum() > 0:
+        lgbm_pred = (y_lgbm[valid_mask] >= opt_threshold).astype(int)
+        val_sub = val_df.iloc[np.where(valid_mask)[0]]
+        print("\nArtifact recall by subtype (LGBM @ optimal threshold):")
+        for st in ("spurious", "interpolate"):
+            mask = (val_sub["label"].values == "artifact") & (val_sub["subtype"].values == st)
+            n = int(mask.sum())
+            if n == 0:
+                print(f"  {st:>11}: 0 examples in val")
+                continue
+            tp = int(lgbm_pred[mask].sum())
+            print(f"  {st:>11}: {tp} / {n} = {tp/n:.3f}")
+
     # ── Comparison table ──────────────────────────────────────────────────
     rows = [
         ("random baseline",              random_pr_auc,  random_roc_auc),
