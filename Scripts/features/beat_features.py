@@ -611,7 +611,15 @@ def compute_beat_feature_matrix(
     # ── Feature group 4: Physio constraint pass-through ──────────────────
     logger.debug("Computing Group 4: physio constraint pass-through from physio_constraints.py")
     physio_labels = labels_sorted.copy()
-    physio_labels["is_added_peak"] = peaks_sorted["is_added_peak"].values
+    # Derive the legacy `is_added_peak` feature from labels_sorted.subtype.
+    # The peaks.parquet column was retired; the equivalent info now lives
+    # in labels.parquet.subtype == "added".
+    if "subtype" in labels_sorted.columns:
+        physio_labels["is_added_peak"] = (
+            labels_sorted["subtype"].astype(str).values == "added"
+        )
+    else:
+        physio_labels["is_added_peak"] = np.zeros(len(labels_sorted), dtype=bool)
     physio_feats = _extract_physio_features(physio_labels)
     feats.update(physio_feats)
 
@@ -738,42 +746,6 @@ def _load_ecg_windows_from_peaks_csv(
     ecg_ts = ecg_samples_df["timestamp_ms"].values.astype(np.int64)
     ecg_vals = ecg_samples_df["ecg"].values.astype(np.float32)
     return _load_ecg_windows_numba(peak_ts, ecg_ts, ecg_vals, window_size, PEAK_SNAP_SAMPLES)
-
-    peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
-    half = window_size // 2
-
-    # Binary search for nearest sample to each peak
-    insert_idx = np.searchsorted(ecg_ts, peak_ts, side="left")
-
-    for i in range(n_peaks):
-        center = int(insert_idx[i])
-        # Refine: pick closer of left/right neighbour
-        if center > 0 and center < n_ecg:
-            if abs(ecg_ts[center - 1] - peak_ts[i]) < abs(ecg_ts[center] - peak_ts[i]):
-                center = center - 1
-        elif center >= n_ecg:
-            center = n_ecg - 1
-
-        # Snap to local amplitude maximum: Pan-Tompkins returns the MWI peak,
-        # which is biased toward the QRS upslope. Correcting to argmax(|ecg|)
-        # within ±PEAK_SNAP_SAMPLES centres the window on the actual R-peak apex.
-        snap_lo = max(0, center - PEAK_SNAP_SAMPLES)
-        snap_hi = min(n_ecg, center + PEAK_SNAP_SAMPLES + 1)
-        center  = snap_lo + int(np.argmax(np.abs(ecg_vals[snap_lo:snap_hi])))
-
-        start = center - half
-        end = start + window_size
-
-        # Clip to valid range
-        src_start = max(0, start)
-        src_end = min(n_ecg, end)
-        dst_start = src_start - start
-        dst_end = dst_start + (src_end - src_start)
-
-        if src_end > src_start:
-            windows[i, dst_start:dst_end] = ecg_vals[src_start:src_end]
-
-    return windows
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

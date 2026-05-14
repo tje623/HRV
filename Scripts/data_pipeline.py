@@ -1049,19 +1049,18 @@ def build_peaks(
     """Build the deduplicated peaks canonical table.
 
     Merges R-peaks from CSV with manually added peaks pulled from
-    ``beats.parquet`` (rows where ``is_added_peak`` is True). Deduplicates
+    ``beats.parquet`` (rows where ``subtype == "added"``). Deduplicates
     within ``DEDUP_TOLERANCE_MS``, preferring annotation rows.
 
     Args:
         peak_csv_df: Raw peak DataFrame from load_peak_csvs.
-        beats_df: ``beats.parquet`` content; rows with ``is_added_peak=True``
+        beats_df: ``beats.parquet`` content; rows with ``subtype == "added"``
             contribute manually-added peak timestamps.
         recording_start_ns: Epoch ns of recording start (for segment_idx).
 
     Returns:
         DataFrame with columns: peak_id (int64, auto-increment),
-        timestamp_ms (int64), segment_idx (int32), source (str),
-        is_added_peak (bool).
+        timestamp_ms (int64), segment_idx (int32), source (str).
     """
     # ── Collect CSV peaks ──────────────────────────────────────────────────
     csv_ts_ns = peak_csv_df["peak_id"].values.astype(np.int64)
@@ -1071,21 +1070,14 @@ def build_peaks(
         if "source" in peak_csv_df.columns
         else np.full(len(csv_ts_ns), "detected", dtype=object)
     )
-    csv_is_added = (
-        peak_csv_df["is_added_peak"].values
-        if "is_added_peak" in peak_csv_df.columns
-        else np.full(len(csv_ts_ns), False, dtype=bool)
-    )
 
     records: list[dict[str, Any]] = []
     for i in range(len(csv_ts_ns)):
         src = str(csv_source[i]) if not pd.isna(csv_source[i]) else "detected"
-        added = bool(csv_is_added[i]) if not pd.isna(csv_is_added[i]) else False
         records.append(
             {
                 "timestamp_ms": int(csv_ts_ns[i]),
                 "source": src,
-                "is_added_peak": added,
                 "_origin": "csv",
             }
         )
@@ -1093,17 +1085,16 @@ def build_peaks(
     # ── Collect added peaks from beats.parquet ─────────────────────────────
     if (
         len(beats_df) > 0
-        and "is_added_peak" in beats_df.columns
+        and "subtype" in beats_df.columns
         and "timestamp_ms" in beats_df.columns
     ):
-        added_mask = beats_df["is_added_peak"].fillna(False).astype(bool).values
+        added_mask = (beats_df["subtype"] == "added").values
         added_ts = beats_df.loc[added_mask, "timestamp_ms"].astype(np.int64).values
         for ts in added_ts:
             records.append(
                 {
                     "timestamp_ms": int(ts),
                     "source": "added",
-                    "is_added_peak": True,
                     "_origin": "annotation",
                 }
             )
@@ -1150,7 +1141,6 @@ def build_peaks(
 
     peaks_df["timestamp_ms"] = peaks_df["timestamp_ms"].astype(np.int64)
     peaks_df["segment_idx"] = peaks_df["segment_idx"].astype(np.int32)
-    peaks_df["is_added_peak"] = peaks_df["is_added_peak"].astype(bool)
 
     logger.info(
         "Built peaks table: %d peaks (%d detected, %d added)",
@@ -1176,10 +1166,9 @@ def build_labels(
     they are not training-eligible).
 
     Label mapping (from ``beats_df.label``):
-      "clean"    → "clean"        (phys_event_window=False)
-      "artifact" → "artifact"     (phys_event_window=False, includes legacy
-                                   interpolation peaks)
-      "physio"   → "phys_event"   (phys_event_window=True)
+      "clean"    → "clean"
+      "artifact" → "artifact"   (includes legacy interpolation peaks)
+      "physio"   → "phys_event"
 
     Reviewed flag:
       ``beats.parquet`` is pre-filtered to training-eligible rows only —
@@ -1187,23 +1176,16 @@ def build_labels(
       excluded by the upstream annotation builder. Therefore
       ``reviewed = matched_to_beats_parquet AND beat_training_eligible``.
 
-    in_bad_region:
-      Computed here from ``bad_region_ranges`` for downstream observability.
-      Note: beats inside bad regions are already absent from ``beats.parquet``,
-      so they will have ``reviewed=False``; ``in_bad_region`` is set so that
-      callers can distinguish "uninterpretable" from merely "unreviewed".
-
     Args:
         peaks_df: Canonical peaks table (with timestamp_ms and segment_idx).
         beats_df: ``beats.parquet`` content (training-eligible beats only).
-        bad_region_ranges: List of (segment_idx, start_ms, end_ms) tuples
-            from extract_bad_region_time_ranges(). If None or empty,
-            ``in_bad_region`` is all False.
+        bad_region_ranges: Retained for call-site compatibility; bad-region
+            beats are already scrubbed upstream so this parameter is ignored.
         diagnostics_dir: Optional directory for annotation/peak alignment CSVs.
 
     Returns:
         DataFrame with columns: peak_id (int64), label (str),
-        phys_event_window (bool), reviewed (bool), in_bad_region (bool).
+        subtype (str, "" for unmatched/unknown peaks), reviewed (bool).
     """
     peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     n_peaks = len(peak_ts)
@@ -1213,7 +1195,7 @@ def build_labels(
     # up the closest beat timestamp; the match is accepted if the distance
     # is within ANNOTATION_MATCH_TOLERANCE_MS.
     labels = np.full(n_peaks, "unknown", dtype=object)
-    in_phys_window = np.zeros(n_peaks, dtype=bool)
+    subtypes = np.full(n_peaks, "", dtype=object)
     is_reviewed = np.zeros(n_peaks, dtype=bool)
     matched = np.zeros(n_peaks, dtype=bool)
 
@@ -1223,6 +1205,11 @@ def build_labels(
         beats_sorted = beats_sorted.sort_values("timestamp_ms").reset_index(drop=True)
         beat_ts = beats_sorted["timestamp_ms"].values.astype(np.int64)
         beat_label = beats_sorted["label"].astype(str).values
+        beat_subtype = (
+            beats_sorted["subtype"].astype(str).values
+            if "subtype" in beats_sorted.columns
+            else np.full(len(beats_sorted), "", dtype=object)
+        )
         if "beat_training_eligible" in beats_sorted.columns:
             beat_eligible = (
                 beats_sorted["beat_training_eligible"].fillna(False).astype(bool).values
@@ -1239,6 +1226,7 @@ def build_labels(
         # Pull labels and eligibility from the matched beat rows
         matched_beat_label = beat_label[nearest_idx]
         matched_beat_eligible = beat_eligible[nearest_idx]
+        matched_beat_subtype = beat_subtype[nearest_idx]
 
         # Apply BEAT_LABEL_MAP only to matched peaks; warn on unknown labels
         unknown_label_mask = matched & ~np.isin(
@@ -1256,8 +1244,7 @@ def build_labels(
         for src, dst in BEAT_LABEL_MAP.items():
             mask = matched & (matched_beat_label == src)
             labels[mask] = dst
-            if dst == "phys_event":
-                in_phys_window[mask] = True
+            subtypes[mask] = matched_beat_subtype[mask]
 
         is_reviewed = matched & matched_beat_eligible.astype(bool)
 
@@ -1326,7 +1313,7 @@ def build_labels(
             status_cols = [
                 "input_beat_row", "input_match_status", "timestamp_ms",
                 "timestamp_iso", "timestamp_local", "segment_idx", "label",
-                "original_annotation", "is_added_peak", "nearest_peak_id",
+                "subtype", "nearest_peak_id",
                 "nearest_peak_timestamp_ms", "nearest_peak_timestamp_iso",
                 "nearest_peak_timestamp_local", "nearest_peak_delta_ms",
                 "nearest_peak_abs_distance_ms",
@@ -1367,7 +1354,7 @@ def build_labels(
             ].map(timestamp_ms_to_local_display)
 
             group_cols = [
-                c for c in ("original_annotation", "label", "is_added_peak")
+                c for c in ("subtype", "label")
                 if c in unmatched.columns
             ]
             if group_cols:
@@ -1389,8 +1376,8 @@ def build_labels(
             if diagnostics_dir is not None:
                 cols = [
                     "input_beat_row", "timestamp_ms", "timestamp_iso", "timestamp_local",
-                    "segment_idx", "label", "original_annotation",
-                    "is_added_peak", "nearest_peak_id",
+                    "segment_idx", "label", "subtype",
+                    "nearest_peak_id",
                     "nearest_peak_timestamp_ms", "nearest_peak_timestamp_iso",
                     "nearest_peak_timestamp_local",
                     "nearest_peak_delta_ms", "nearest_peak_abs_distance_ms",
@@ -1428,29 +1415,12 @@ def build_labels(
             n_peaks,
         )
 
-    # ── in_bad_region flag (informational; eligibility already handled) ───
-    in_bad_region = np.zeros(n_peaks, dtype=bool)
-    if bad_region_ranges:
-        for _ignored_seg, br_start, br_end in bad_region_ranges:
-            # Match by absolute timestamp only — a segment_idx equality check
-            # silently drops legitimate bad regions whenever the pipeline's
-            # recording_start_ns differs from the annotation builder's by even
-            # a millisecond, since beats near a 60-s boundary then fall in a
-            # neighbouring segment_idx.
-            mask = (peak_ts >= br_start) & (peak_ts <= br_end)
-            in_bad_region |= mask
-        logger.info(
-            "Beats inside bad_region windows: %d (in_bad_region=True)",
-            int(in_bad_region.sum()),
-        )
-
     result = pd.DataFrame(
         {
             "peak_id": peaks_df["peak_id"].values.astype(np.int64),
             "label": labels,
-            "phys_event_window": in_phys_window,
+            "subtype": subtypes,
             "reviewed": is_reviewed,
-            "in_bad_region": in_bad_region,
         }
     )
 
