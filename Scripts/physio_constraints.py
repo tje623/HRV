@@ -273,15 +273,17 @@ def build_pots_windows(labels_df: pd.DataFrame) -> list[tuple[int, int]]:
         )
         return []
 
-    if "phys_event_window" not in labels_df.columns:
+    if "label" not in labels_df.columns:
         logger.warning(
-            "labels_df missing 'phys_event_window' column; no POTS windows"
+            "labels_df missing 'label' column; no POTS windows"
         )
         return []
 
     # Sort by timestamp for contiguity detection
     df = labels_df.sort_values("timestamp_ms").reset_index(drop=True)
-    phys_mask = df["phys_event_window"].values.astype(bool)
+    # phys_event_window was dropped from labels.parquet as a literal alias
+    # of label == "phys_event"; derive it inline here.
+    phys_mask = (df["label"] == "phys_event").values.astype(bool)
     ts = df["timestamp_ms"].values.astype(np.int64)
 
     if not phys_mask.any():
