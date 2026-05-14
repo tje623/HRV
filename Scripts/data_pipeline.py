@@ -35,7 +35,7 @@ Label mapping into the canonical tables:
   beats.label "clean"    → labels.label "clean",    phys_event_window=False
   beats.label "artifact" → labels.label "artifact", phys_event_window=False
   beats.label "physio"   → labels.label "phys_event", phys_event_window=True
-  Peaks not present in beats.parquet → label "clean", reviewed=False
+  Peaks not present in beats.parquet → label "unknown", reviewed=False
   segment_quality_label "usable"   → quality_label "clean"
   segment_quality_label "partial"  → quality_label "noisy_ok"
   segment_quality_label "unusable" → quality_label "bad"
@@ -238,6 +238,133 @@ def timestamps_match_with_tolerance(
     return min_dist <= tolerance_ns
 
 
+def nearest_indices_and_distances(
+    query_ts: np.ndarray,
+    reference_ts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return nearest reference index, absolute distance, and signed delta.
+
+    ``query_ts`` and ``reference_ts`` are millisecond epoch timestamps. The
+    signed delta is ``nearest_reference_ts - query_ts``.
+    """
+    query_ts = query_ts.astype(np.int64, copy=False)
+    reference_ts = reference_ts.astype(np.int64, copy=False)
+    if len(reference_ts) == 0:
+        return (
+            np.full(len(query_ts), -1, dtype=np.int64),
+            np.full(len(query_ts), np.iinfo(np.int64).max, dtype=np.int64),
+            np.full(len(query_ts), np.iinfo(np.int64).max, dtype=np.int64),
+        )
+
+    idx = np.searchsorted(reference_ts, query_ts, side="left")
+    idx_left = np.clip(idx - 1, 0, len(reference_ts) - 1)
+    idx_right = np.clip(idx, 0, len(reference_ts) - 1)
+    dist_left = np.abs(query_ts - reference_ts[idx_left])
+    dist_right = np.abs(reference_ts[idx_right] - query_ts)
+    use_left = dist_left <= dist_right
+    nearest_idx = np.where(use_left, idx_left, idx_right).astype(np.int64)
+    nearest_dist = np.where(use_left, dist_left, dist_right).astype(np.int64)
+    signed_delta = (reference_ts[nearest_idx] - query_ts).astype(np.int64)
+    return nearest_idx, nearest_dist, signed_delta
+
+
+def timestamp_ms_to_iso(value: int | float | None) -> str:
+    """Format epoch milliseconds for diagnostics CSVs."""
+    if value is None or pd.isna(value):
+        return ""
+    try:
+        return pd.Timestamp(int(value), unit="ms").isoformat()
+    except (ValueError, OverflowError):
+        return str(value)
+
+
+def distance_bucket(distance_ms: int) -> str:
+    """Human-readable nearest-peak distance bucket."""
+    if distance_ms <= ANNOTATION_MATCH_TOLERANCE_MS:
+        return f"<={ANNOTATION_MATCH_TOLERANCE_MS}ms"
+    if distance_ms <= 160:
+        return "81-160ms"
+    if distance_ms <= 250:
+        return "161-250ms"
+    if distance_ms <= 500:
+        return "251-500ms"
+    if distance_ms <= 1000:
+        return "501ms-1s"
+    if distance_ms <= 60_000:
+        return "1s-60s"
+    return ">60s"
+
+
+def write_csv(df: pd.DataFrame, path: Path) -> None:
+    """Write a CSV diagnostic, creating parent directories."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+def boolish(value: Any) -> bool:
+    """Parse common bool-like values from parquet/pandas rows."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None or pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "1", "t", "yes", "y"}
+
+
+def timestamp_ms_to_local_display(value: int | float | None) -> str:
+    """Format epoch milliseconds as m/d/yy h:mm:ss.000 am/pm."""
+    if value is None or pd.isna(value):
+        return ""
+    try:
+        ts = pd.Timestamp(int(value), unit="ms", tz="UTC").tz_convert("America/New_York")
+    except (ValueError, OverflowError):
+        return str(value)
+    hour = ts.hour % 12 or 12
+    suffix = "am" if ts.hour < 12 else "pm"
+    return (
+        f"{ts.month}/{ts.day}/{ts.year % 100:02d} "
+        f"{hour}:{ts.minute:02d}:{ts.second:02d}.{int(ts.microsecond / 1000):03d} {suffix}"
+    )
+
+
+def collapse_segment_diagnostic_ranges(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse diagnostic segment rows into contiguous input-segment ranges."""
+    if len(df) == 0 or "input_segment_idx" not in df.columns:
+        return pd.DataFrame(
+            columns=[
+                "start_input_segment_idx", "end_input_segment_idx", "count",
+                "start_ms", "start_iso", "start_local", "end_ms", "end_iso", "end_local",
+            ]
+        )
+
+    rows = df.sort_values("input_segment_idx").reset_index(drop=True)
+    group_id = (
+        rows["input_segment_idx"]
+        - pd.Series(np.arange(len(rows)), index=rows.index, dtype=np.int64)
+    )
+    ranges = (
+        rows.assign(_group_id=group_id)
+        .groupby("_group_id", sort=False)
+        .agg(
+            start_input_segment_idx=("input_segment_idx", "min"),
+            end_input_segment_idx=("input_segment_idx", "max"),
+            count=("input_segment_idx", "size"),
+            start_ms=("start_ms", "min"),
+            end_ms=("end_ms", "max"),
+        )
+        .reset_index(drop=True)
+    )
+    ranges["start_iso"] = ranges["start_ms"].map(timestamp_ms_to_iso)
+    ranges["end_iso"] = ranges["end_ms"].map(timestamp_ms_to_iso)
+    ranges["start_local"] = ranges["start_ms"].map(timestamp_ms_to_local_display)
+    ranges["end_local"] = ranges["end_ms"].map(timestamp_ms_to_local_display)
+    return ranges[
+        [
+            "start_input_segment_idx", "end_input_segment_idx", "count",
+            "start_ms", "start_iso", "start_local", "end_ms", "end_iso", "end_local",
+        ]
+    ]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # ANNOTATION HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -252,9 +379,11 @@ BEAT_LABEL_MAP: dict[str, str] = {
 
 # Mapping from segments.parquet `segment_quality_label` to canonical
 # segments.parquet `quality_label` values consumed by segment_quality.py.
+# Note: `usable` maps to `clean` here at the dict level, but build_segments()
+# further splits `usable` segments by RMSSD into clean / noisy_ok / unknown.
 SEGMENT_QUALITY_MAP: dict[str, str] = {
     "usable": "clean",
-    "partial": "noisy_ok",
+    "unclean": "noisy_ok",
     "unusable": "bad",
     "unknown": "unknown",
 }
@@ -919,13 +1048,14 @@ def build_labels(
     peaks_df: pd.DataFrame,
     beats_df: pd.DataFrame,
     bad_region_ranges: list[tuple[int, int, int]] | None = None,
+    diagnostics_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Build beat-level labels by matching pipeline peaks against beats.parquet.
 
     Each peak in ``peaks_df`` is matched to its nearest beat in ``beats_df`` by
     ``timestamp_ms`` within ``ANNOTATION_MATCH_TOLERANCE_MS``. When matched,
     the canonical label and reviewed flag are inherited from the beat row;
-    unmatched peaks default to ``label="clean"``, ``reviewed=False`` (i.e.
+    unmatched peaks default to ``label="unknown"``, ``reviewed=False`` (i.e.
     they are not training-eligible).
 
     Label mapping (from ``beats_df.label``):
@@ -952,6 +1082,7 @@ def build_labels(
         bad_region_ranges: List of (segment_idx, start_ms, end_ms) tuples
             from extract_bad_region_time_ranges(). If None or empty,
             ``in_bad_region`` is all False.
+        diagnostics_dir: Optional directory for annotation/peak alignment CSVs.
 
     Returns:
         DataFrame with columns: peak_id (int64), label (str),
@@ -964,13 +1095,15 @@ def build_labels(
     # Vectorized nearest-neighbour search: for each peak timestamp we look
     # up the closest beat timestamp; the match is accepted if the distance
     # is within ANNOTATION_MATCH_TOLERANCE_MS.
-    labels = np.full(n_peaks, "clean", dtype=object)
+    labels = np.full(n_peaks, "unknown", dtype=object)
     in_phys_window = np.zeros(n_peaks, dtype=bool)
     is_reviewed = np.zeros(n_peaks, dtype=bool)
     matched = np.zeros(n_peaks, dtype=bool)
 
     if len(beats_df) > 0 and "timestamp_ms" in beats_df.columns:
-        beats_sorted = beats_df.sort_values("timestamp_ms").reset_index(drop=True)
+        beats_sorted = beats_df.reset_index().rename(columns={"index": "input_beat_row"})
+        beats_sorted["input_beat_row"] = beats_sorted["input_beat_row"].astype(np.int64) + 1
+        beats_sorted = beats_sorted.sort_values("timestamp_ms").reset_index(drop=True)
         beat_ts = beats_sorted["timestamp_ms"].values.astype(np.int64)
         beat_label = beats_sorted["label"].astype(str).values
         if "beat_training_eligible" in beats_sorted.columns:
@@ -980,15 +1113,10 @@ def build_labels(
         else:
             beat_eligible = np.ones(len(beats_sorted), dtype=bool)
 
-        # Nearest-neighbour by binary search
-        idx = np.searchsorted(beat_ts, peak_ts, side="left")
-        idx_left = np.clip(idx - 1, 0, len(beat_ts) - 1)
-        idx_right = np.clip(idx, 0, len(beat_ts) - 1)
-        dist_left = np.abs(peak_ts - beat_ts[idx_left])
-        dist_right = np.abs(peak_ts - beat_ts[idx_right])
-        use_left = dist_left <= dist_right
-        nearest_idx = np.where(use_left, idx_left, idx_right)
-        nearest_dist = np.where(use_left, dist_left, dist_right)
+        # Nearest-neighbour by binary search: pipeline peak -> input beat.
+        nearest_idx, nearest_dist, _signed_delta = nearest_indices_and_distances(
+            peak_ts, beat_ts
+        )
         matched = nearest_dist <= ANNOTATION_MATCH_TOLERANCE_MS
 
         # Pull labels and eligibility from the matched beat rows
@@ -1019,23 +1147,167 @@ def build_labels(
         n_matched = int(matched.sum())
         n_eligible = int(is_reviewed.sum())
         logger.info(
-            "Matched %d / %d input beats to pipeline peaks (tolerance %d ms); "
-            "%d are training-eligible",
-            n_matched, len(beats_df), ANNOTATION_MATCH_TOLERANCE_MS, n_eligible,
+            "Labeled %d / %d pipeline peaks from annotation beats "
+            "(tolerance %d ms); %d are training-eligible",
+            n_matched, n_peaks, ANNOTATION_MATCH_TOLERANCE_MS, n_eligible,
         )
-        # Beats present in beats.parquet but with no nearby pipeline peak
-        # mean the input was built against a different peak detection pass.
-        # Surface this loudly because it indicates stale annotation inputs.
-        unmatched_input = len(beats_df) - n_matched
+
+        # The peak->beat count above is not the same as asking whether every
+        # annotation input beat has a nearby pipeline peak. Compute that
+        # direction explicitly so the warning describes the actual problem.
+        peaks_for_input = peaks_df.sort_values("timestamp_ms").reset_index(drop=True)
+        input_nearest_idx, input_nearest_dist, input_delta = nearest_indices_and_distances(
+            beat_ts, peaks_for_input["timestamp_ms"].values.astype(np.int64)
+        )
+        input_matched = input_nearest_dist <= ANNOTATION_MATCH_TOLERANCE_MS
+        input_used_by_peak = np.zeros(len(beats_sorted), dtype=bool)
+        input_used_by_peak[nearest_idx[matched]] = True
+        input_status = np.full(
+            len(beats_sorted),
+            "peak_within_80_but_no_pipeline_peak_chose_this_beat",
+            dtype=object,
+        )
+        input_status[~input_matched] = "no_peak_within_80"
+        input_status[input_used_by_peak] = "contributes_to_label"
+        unmatched_input = int((~input_matched).sum())
+        logger.info(
+            "Input beat-to-peak alignment: %d / %d input beats have a pipeline "
+            "peak within %d ms",
+            int(input_matched.sum()), len(beats_sorted), ANNOTATION_MATCH_TOLERANCE_MS,
+        )
+        status_df = beats_sorted.copy()
+        status_df["input_match_status"] = input_status
+        status_df["nearest_peak_id"] = peaks_for_input.loc[
+            input_nearest_idx, "peak_id"
+        ].to_numpy(dtype=np.int64)
+        status_df["nearest_peak_timestamp_ms"] = peaks_for_input.loc[
+            input_nearest_idx, "timestamp_ms"
+        ].to_numpy(dtype=np.int64)
+        status_df["nearest_peak_delta_ms"] = input_delta
+        status_df["nearest_peak_abs_distance_ms"] = input_nearest_dist
+        status_df["timestamp_iso"] = status_df["timestamp_ms"].map(timestamp_ms_to_iso)
+        status_df["timestamp_local"] = status_df["timestamp_ms"].map(
+            timestamp_ms_to_local_display
+        )
+        status_df["nearest_peak_timestamp_iso"] = status_df[
+            "nearest_peak_timestamp_ms"
+        ].map(timestamp_ms_to_iso)
+        status_df["nearest_peak_timestamp_local"] = status_df[
+            "nearest_peak_timestamp_ms"
+        ].map(timestamp_ms_to_local_display)
+        status_groups = (
+            status_df.groupby(["label", "input_match_status"], dropna=False)
+            .size()
+            .reset_index(name="count")
+            .sort_values(["label", "input_match_status"])
+        )
+        logger.info(
+            "Input beat match status by label:\n%s",
+            status_groups.to_string(index=False),
+        )
+        if diagnostics_dir is not None:
+            status_cols = [
+                "input_beat_row", "input_match_status", "timestamp_ms",
+                "timestamp_iso", "timestamp_local", "segment_idx", "label",
+                "original_annotation", "is_added_peak", "nearest_peak_id",
+                "nearest_peak_timestamp_ms", "nearest_peak_timestamp_iso",
+                "nearest_peak_timestamp_local", "nearest_peak_delta_ms",
+                "nearest_peak_abs_distance_ms",
+            ]
+            status_cols = [c for c in status_cols if c in status_df.columns]
+            write_csv(
+                status_df[status_cols],
+                diagnostics_dir / "annotation_beat_match_status.csv",
+            )
+            write_csv(
+                status_groups,
+                diagnostics_dir / "annotation_beat_match_status_groups.csv",
+            )
         if unmatched_input > 0:
             logger.warning(
                 "%d input beat row(s) had no pipeline peak within %d ms — "
                 "annotation INPUT may be out of sync with current peaks.parquet",
                 unmatched_input, ANNOTATION_MATCH_TOLERANCE_MS,
             )
+            unmatched = beats_sorted.loc[~input_matched].copy()
+            unmatched["nearest_peak_id"] = peaks_for_input.loc[
+                input_nearest_idx[~input_matched], "peak_id"
+            ].to_numpy(dtype=np.int64)
+            unmatched["nearest_peak_timestamp_ms"] = peaks_for_input.loc[
+                input_nearest_idx[~input_matched], "timestamp_ms"
+            ].to_numpy(dtype=np.int64)
+            unmatched["nearest_peak_delta_ms"] = input_delta[~input_matched]
+            unmatched["nearest_peak_abs_distance_ms"] = input_nearest_dist[~input_matched]
+            unmatched["timestamp_iso"] = unmatched["timestamp_ms"].map(timestamp_ms_to_iso)
+            unmatched["timestamp_local"] = unmatched["timestamp_ms"].map(
+                timestamp_ms_to_local_display
+            )
+            unmatched["nearest_peak_timestamp_iso"] = unmatched[
+                "nearest_peak_timestamp_ms"
+            ].map(timestamp_ms_to_iso)
+            unmatched["nearest_peak_timestamp_local"] = unmatched[
+                "nearest_peak_timestamp_ms"
+            ].map(timestamp_ms_to_local_display)
+
+            group_cols = [
+                c for c in ("original_annotation", "label", "is_added_peak")
+                if c in unmatched.columns
+            ]
+            if group_cols:
+                logger.warning(
+                    "Unmatched input beats by source:\n%s",
+                    unmatched.groupby(group_cols)
+                    .size()
+                    .sort_values(ascending=False)
+                    .to_string(),
+                )
+            bucket_counts = (
+                pd.Series(input_nearest_dist)
+                .map(lambda d: distance_bucket(int(d)))
+                .value_counts()
+                .sort_index()
+            )
+            logger.info("Input beat nearest-peak distance buckets:\n%s", bucket_counts.to_string())
+
+            if diagnostics_dir is not None:
+                cols = [
+                    "input_beat_row", "timestamp_ms", "timestamp_iso", "timestamp_local",
+                    "segment_idx", "label", "original_annotation",
+                    "is_added_peak", "nearest_peak_id",
+                    "nearest_peak_timestamp_ms", "nearest_peak_timestamp_iso",
+                    "nearest_peak_timestamp_local",
+                    "nearest_peak_delta_ms", "nearest_peak_abs_distance_ms",
+                ]
+                cols = [c for c in cols if c in unmatched.columns]
+                write_csv(
+                    unmatched[cols].sort_values("nearest_peak_abs_distance_ms", ascending=False),
+                    diagnostics_dir / "annotation_unmatched_beats.csv",
+                )
+                summary = (
+                    unmatched.assign(
+                        distance_bucket=unmatched["nearest_peak_abs_distance_ms"].map(
+                            lambda d: distance_bucket(int(d))
+                        )
+                    )
+                    .groupby(group_cols + ["distance_bucket"], dropna=False)
+                    .size()
+                    .reset_index(name="count")
+                    if group_cols else pd.DataFrame()
+                )
+                if len(summary) > 0:
+                    write_csv(summary, diagnostics_dir / "annotation_unmatched_beat_groups.csv")
+                write_csv(
+                    pd.DataFrame(
+                        {
+                            "distance_bucket": bucket_counts.index.astype(str),
+                            "count": bucket_counts.values.astype(np.int64),
+                        }
+                    ),
+                    diagnostics_dir / "annotation_peak_distance_buckets.csv",
+                )
     else:
         logger.warning(
-            "beats_df is empty — all %d peaks default to label='clean', reviewed=False",
+            "beats_df is empty — all %d peaks default to label='unknown', reviewed=False",
             n_peaks,
         )
 
@@ -1079,6 +1351,7 @@ def build_segments(
     seg_ranges: dict[int, tuple[int, int]],
     segments_input_df: pd.DataFrame,
     recording_start_ns: int,
+    diagnostics_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Build segment-level quality labels from the input segments parquet.
 
@@ -1092,52 +1365,171 @@ def build_segments(
       "unknown"  → "unknown"
 
     Segments that exist in ECG (``seg_ranges``) but are absent from the input
-    annotation are emitted with ``quality_label="unknown"``.
+    annotation are emitted with ``quality_label="unknown"``. Annotation
+    ``segment_idx`` values are treated as GUI/input ordinals; mapping to
+    canonical pipeline ``segment_idx`` is done by absolute ``start_ms`` /
+    ``end_ms`` overlap.
 
     Args:
         seg_ranges: Per-segment timestamp ranges, {segment_idx: (min_ms, max_ms)},
             returned by stream_ecg_to_parquet().
         segments_input_df: ``segments.parquet`` content from the annotation
             INPUT directory.
-        recording_start_ns: Epoch ms of recording start (used to synthesize a
-            timestamp range when a segment is absent from seg_ranges).
+        recording_start_ns: Epoch ms of recording start, used to translate
+            annotation start/end timestamps into canonical pipeline segment_idx.
+        diagnostics_dir: Optional directory for annotation/segment mapping CSVs.
 
     Returns:
         DataFrame with columns: segment_idx (int32), quality_label (str),
         start_timestamp_ms (int64), end_timestamp_ms (int64).
     """
-    # Build segment_idx → segment_quality_label lookup
+    # Build pipeline segment_idx -> segment quality by timestamp overlap.
+    # The annotation input's segment_idx is a compact GUI ordinal over recorded
+    # windows, while ecg_samples.segment_idx is a wall-clock bin from
+    # recording_start_ns. Comparing those raw IDs directly is a namespace bug.
     quality_by_seg: dict[int, str] = {}
+    overlap_by_seg: dict[int, int] = {}
+    priority_by_quality = {"unknown": 0, "clean": 1, "noisy_ok": 2, "bad": 3}
+    mapping_records: list[dict[str, Any]] = []
+
     if len(segments_input_df) > 0 and "segment_quality_label" in segments_input_df.columns:
         unknown_inputs: set[str] = set()
-        for seg_idx, raw_label in zip(
-            segments_input_df["segment_idx"].astype(np.int64).values,
-            segments_input_df["segment_quality_label"].astype(str).values,
-        ):
+        required_cols = {"segment_idx", "start_ms", "end_ms", "segment_quality_label"}
+        missing_cols = required_cols - set(segments_input_df.columns)
+        if missing_cols:
+            raise ValueError(
+                f"segments.parquet is missing required column(s): {sorted(missing_cols)}"
+            )
+
+        for row in segments_input_df.itertuples(index=False):
+            input_seg_idx = int(getattr(row, "segment_idx"))
+            start_ms = int(getattr(row, "start_ms"))
+            end_ms = int(getattr(row, "end_ms"))
+            raw_label = str(getattr(row, "segment_quality_label"))
             if raw_label in SEGMENT_QUALITY_MAP:
-                quality_by_seg[int(seg_idx)] = SEGMENT_QUALITY_MAP[raw_label]
+                quality = SEGMENT_QUALITY_MAP[raw_label]
             else:
                 unknown_inputs.add(raw_label)
-                quality_by_seg[int(seg_idx)] = "unknown"
+                quality = "unknown"
+
+            wall_start_seg = int((start_ms - recording_start_ns) // SEGMENT_DURATION_MS)
+            wall_end_seg = int(
+                (max(start_ms, end_ms - 1) - recording_start_ns) // SEGMENT_DURATION_MS
+            )
+            candidate_segments = range(wall_start_seg, wall_end_seg + 1)
+            best_pipe_seg: int | None = None
+            max_overlap = 0
+
+            for pipe_seg in candidate_segments:
+                pipe_start = recording_start_ns + pipe_seg * SEGMENT_DURATION_MS
+                pipe_end = recording_start_ns + (pipe_seg + 1) * SEGMENT_DURATION_MS
+                overlap = max(0, min(end_ms, pipe_end) - max(start_ms, pipe_start))
+                if overlap <= 0 or pipe_seg not in seg_ranges:
+                    continue
+
+                if overlap > max_overlap:
+                    best_pipe_seg = pipe_seg
+                    max_overlap = int(overlap)
+
+            review_status = str(getattr(row, "review_status", ""))
+            segment_quality_training_eligible = (
+                boolish(getattr(row, "segment_quality_training_eligible"))
+                if hasattr(row, "segment_quality_training_eligible")
+                else review_status != "revisit"
+            )
+            applies_to_training_label = (
+                best_pipe_seg is not None
+                and segment_quality_training_eligible
+                and review_status != "revisit"
+                and raw_label in {"usable", "partial", "unusable"}
+            )
+            applied_pipe_seg: int | None = None
+            if applies_to_training_label:
+                old_overlap = overlap_by_seg.get(best_pipe_seg, -1)
+                old_quality = quality_by_seg.get(best_pipe_seg, "unknown")
+                should_replace = max_overlap > old_overlap or (
+                    max_overlap == old_overlap
+                    and priority_by_quality[quality] > priority_by_quality[old_quality]
+                )
+                if should_replace:
+                    quality_by_seg[best_pipe_seg] = quality
+                    overlap_by_seg[best_pipe_seg] = int(max_overlap)
+                applied_pipe_seg = best_pipe_seg
+
+            record = {
+                "input_segment_idx": input_seg_idx,
+                "start_ms": start_ms,
+                "start_iso": timestamp_ms_to_iso(start_ms),
+                "start_local": timestamp_ms_to_local_display(start_ms),
+                "end_ms": end_ms,
+                "end_iso": timestamp_ms_to_iso(end_ms),
+                "end_local": timestamp_ms_to_local_display(end_ms),
+                "review_status": review_status,
+                "segment_quality_training_eligible": segment_quality_training_eligible,
+                "raw_segment_quality_label": raw_label,
+                "canonical_quality_label": quality,
+                "wall_start_segment_idx": wall_start_seg,
+                "wall_end_segment_idx": wall_end_seg,
+                "raw_segment_idx_exists_in_ecg": input_seg_idx in seg_ranges,
+                "overlaps_ecg_by_time": best_pipe_seg is not None,
+                "best_pipeline_segment_idx": best_pipe_seg,
+                "best_overlap_ms": max_overlap,
+                "applied_to_training_label": applies_to_training_label,
+                "applied_pipeline_segment_idx": applied_pipe_seg,
+            }
+            mapping_records.append(record)
+
         if unknown_inputs:
             logger.warning(
                 "Unrecognized segment_quality_label value(s) %r — mapped to 'unknown'",
                 sorted(unknown_inputs),
             )
 
-    # Combine ECG-observed segments with annotation-input segment_idxs so
-    # that segments classified manually but with no ECG (rare) still appear.
-    all_seg_idxs = sorted(set(seg_ranges.keys()) | set(quality_by_seg.keys()))
+        mapping_df = pd.DataFrame(mapping_records)
+        raw_absent = mapping_df[~mapping_df["raw_segment_idx_exists_in_ecg"]].copy()
+        no_time_overlap = mapping_df[~mapping_df["overlaps_ecg_by_time"]].copy()
+
+        n_raw_absent = len(raw_absent)
+        if n_raw_absent > 0:
+            logger.warning(
+                "%d annotation segment_idx value(s) are absent from ECG by raw ID. "
+                "These are GUI/input ordinals, not canonical ECG segment_idx values; "
+                "segment labels are mapped by timestamp overlap instead.",
+                n_raw_absent,
+            )
+        if len(no_time_overlap) > 0:
+            logger.warning(
+                "%d annotation segment row(s) had no ECG overlap by timestamp",
+                len(no_time_overlap),
+            )
+
+        if diagnostics_dir is not None:
+            write_csv(mapping_df, diagnostics_dir / "annotation_segment_index_mapping.csv")
+            if n_raw_absent > 0:
+                write_csv(
+                    raw_absent,
+                    diagnostics_dir / "annotation_raw_segment_idx_absent_from_ecg.csv",
+                )
+                write_csv(
+                    collapse_segment_diagnostic_ranges(raw_absent),
+                    diagnostics_dir / "annotation_raw_segment_idx_absent_ranges.csv",
+                )
+            write_csv(
+                no_time_overlap,
+                diagnostics_dir / "annotation_segments_without_ecg_overlap.csv",
+            )
+            if len(no_time_overlap) > 0:
+                write_csv(
+                    collapse_segment_diagnostic_ranges(no_time_overlap),
+                    diagnostics_dir / "annotation_segments_without_ecg_overlap_ranges.csv",
+                )
+
+    all_seg_idxs = sorted(seg_ranges.keys())
 
     records: list[dict[str, Any]] = []
     n_missing_in_ecg = 0
     for seg_int in all_seg_idxs:
-        if seg_int in seg_ranges:
-            start_ms, end_ms = seg_ranges[seg_int]
-        else:
-            n_missing_in_ecg += 1
-            start_ms = recording_start_ns + seg_int * SEGMENT_DURATION_MS
-            end_ms = recording_start_ns + (seg_int + 1) * SEGMENT_DURATION_MS
+        start_ms, end_ms = seg_ranges[seg_int]
 
         quality = quality_by_seg.get(seg_int, "unknown")
 
@@ -1151,11 +1543,7 @@ def build_segments(
         )
 
     if n_missing_in_ecg > 0:
-        logger.warning(
-            "%d segment_idx values were classified in segments.parquet but "
-            "absent from ECG (synthesized timestamp ranges)",
-            n_missing_in_ecg,
-        )
+        logger.warning("%d segment rows were synthesized without ECG", n_missing_in_ecg)
 
     result = pd.DataFrame(records)
     result["segment_idx"] = result["segment_idx"].astype(np.int32)
@@ -1375,6 +1763,15 @@ def main() -> None:
         help="Output directory for Parquet files (default: data/processed/)",
     )
     parser.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for annotation/peak/segment diagnostic CSVs "
+            "(default: <output-dir>/diagnostics/data_pipeline)"
+        ),
+    )
+    parser.add_argument(
         "--resume-partial",
         type=Path,
         default=None,
@@ -1438,6 +1835,9 @@ def main() -> None:
     # at a time. Returns seg_ranges dict for downstream use.
     print("\n>> Streaming ECG files → ecg_samples.parquet (no full-dataset concat)...")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir = args.diagnostics_dir or (args.output_dir / "diagnostics" / "data_pipeline")
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Diagnostics directory: %s", diagnostics_dir.resolve())
     ecg_samples_path = args.output_dir / "ecg_samples.parquet"
     seg_ranges = stream_ecg_to_parquet(
         args.ecg_dir, ecg_samples_path, recording_start_ns,
@@ -1453,12 +1853,12 @@ def main() -> None:
     # ── Build labels ───────────────────────────────────────────────────────
     print("\n>> Building labels table...")
     bad_region_ranges = extract_bad_region_time_ranges(bad_regions_df)
-    labels = build_labels(peaks, beats_input_df, bad_region_ranges)
+    labels = build_labels(peaks, beats_input_df, bad_region_ranges, diagnostics_dir)
 
     # ── Build segments ─────────────────────────────────────────────────────
     # Manual segment classification from segments.parquet is authoritative.
     print("\n>> Building segments table...")
-    segments = build_segments(seg_ranges, segments_input_df, recording_start_ns)
+    segments = build_segments(seg_ranges, segments_input_df, recording_start_ns, diagnostics_dir)
 
     # ── Validate referential integrity ─────────────────────────────────────
     print("\n>> Validating referential integrity...")
