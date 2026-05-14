@@ -648,10 +648,17 @@ def train(
         if n_excl > 0:
             logger.info("Excluded %d beats inside bad_regions", n_excl)
 
-    n_interp = int((merged["label"] == "interpolated").sum())
-    if n_interp > 0:
-        merged = merged[merged["label"] != "interpolated"].copy()
-        logger.info("Excluded %d interpolated beats from training", n_interp)
+    # Interpolate-subtype artifacts are now INCLUDED as artifact-positive
+    # examples. Log subtype composition of the artifact class for
+    # evaluation traceability.
+    if "subtype" in merged.columns:
+        n_interp = int(((merged["label"] == "artifact") & (merged["subtype"] == "interpolate")).sum())
+        n_spurious = int(((merged["label"] == "artifact") & (merged["subtype"] == "spurious")).sum())
+        logger.info(
+            "Artifact training set: %d spurious + %d interpolate "
+            "(both included as artifact-positive)",
+            n_spurious, n_interp,
+        )
 
     if "reviewed" in merged.columns:
         n_before = len(merged)
