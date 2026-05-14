@@ -242,8 +242,9 @@ def discover_qrs_motifs(
         Must have ``peak_id``.  Row order matches ``ecg_windows``.
     labels_df : pd.DataFrame
         Must have ``peak_id``, ``label``, ``hard_filtered``.
-        ``phys_event_window`` is intentionally NOT used here — those
-        annotations mark PACs/PVCs/vagal events, not morphology clusters.
+        Beats labeled ``phys_event`` (PACs/PVCs/vagal events) are
+        intentionally NOT used here — those mark physiology, not morphology
+        clusters.
     ecg_windows : np.ndarray
         Shape ``(n_beats, QRS_WINDOW_SAMPLES)``.
     n_clusters : int

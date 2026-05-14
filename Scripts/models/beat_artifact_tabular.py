@@ -378,8 +378,6 @@ def train(
         label_cols.append("hard_filtered")
     if "reviewed" in labels_df.columns:
         label_cols.append("reviewed")
-    if "in_bad_region" in labels_df.columns:
-        label_cols.append("in_bad_region")
     merged = features_df.merge(
         labels_df[label_cols],
         on="peak_id",
@@ -389,8 +387,6 @@ def train(
     # (those CSVs only carry peak_id + label).  Default to False = include all.
     if "hard_filtered" not in merged.columns:
         merged["hard_filtered"] = False
-    if "in_bad_region" not in merged.columns:
-        merged["in_bad_region"] = False
     merged = merged.merge(
         peaks_df[["peak_id", "segment_idx"]].drop_duplicates(),
         on="peak_id",
@@ -449,13 +445,8 @@ def train(
             )
             merged = merged[~excl_mask].copy()
 
-    # ── Exclude beats inside bad_region windows ───────────────────────────
-    if "in_bad_region" in merged.columns:
-        n_before = len(merged)
-        merged = merged[~merged["in_bad_region"]].copy()
-        n_excl = n_before - len(merged)
-        if n_excl > 0:
-            logger.info("Excluded %d beats inside bad_regions", n_excl)
+    # NOTE: bad_region scrubbing is now done upstream in data_pipeline.py;
+    # the legacy `in_bad_region` column has been removed from labels.parquet.
 
     # Interpolate-subtype artifacts are now INCLUDED as artifact-positive
     # examples. Log subtype composition of the artifact class.

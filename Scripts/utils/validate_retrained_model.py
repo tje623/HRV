@@ -46,7 +46,7 @@ logger = logging.getLogger("scripts.validate_retrained_model")
 # ── Label vocabulary (mirrors beat_artifact_tabular.py) ──────────────────────
 ARTIFACT_LABELS = frozenset({"artifact"})
 VALID_LABELS    = frozenset({"clean", "artifact",
-                              "phys_event", "missed_original"})
+                              "phys_event", "unknown"})
 
 
 # ── Model helpers ─────────────────────────────────────────────────────────────

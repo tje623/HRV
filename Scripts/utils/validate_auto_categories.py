@@ -35,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger("scripts.validate_auto_categories")
 
 # ── Label vocabulary ──────────────────────────────────────────────────────────
-CLEAN_REAL_LABELS   = frozenset({"clean", "missed_original", "phys_event"})
+CLEAN_REAL_LABELS   = frozenset({"clean", "phys_event"})
 ARTIFACT_LABEL      = "artifact"
 CLEAN_CAT_NAMES     = frozenset({"pristine", "clean_normal", "clean_low_amplitude", "clean_noisy"})
 ARTIFACT_CAT_NAMES  = frozenset({"artifact_morphology", "artifact_noise",

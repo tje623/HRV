@@ -45,7 +45,7 @@ log = logging.getLogger("ecgclean.ensemble")
 # Valid artifact labels (same label vocabulary used across the pipeline)
 # ---------------------------------------------------------------------------
 ARTIFACT_LABELS = {"artifact"}
-VALID_LABELS = {"clean", "artifact", "phys_event", "missed_original"}
+VALID_LABELS = {"clean", "artifact", "phys_event", "unknown"}
 
 
 # ===================================================================== #

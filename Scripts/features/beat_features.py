@@ -532,7 +532,7 @@ def compute_beat_feature_matrix(
 
     Args:
         peaks_df: Canonical peaks table (peak_id, timestamp_ms, segment_idx,
-            source, is_added_peak).
+            source).
         labels_df: Enriched labels table from physio_constraints (peak_id,
             label, rr_prev_ms, rr_next_ms, hard_filtered, and all soft flags).
         ecg_windows: ECG window array of shape (n_beats, 64), aligned to the

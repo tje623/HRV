@@ -68,7 +68,7 @@ class _NpEncoder(json.JSONEncoder):
         return super().default(obj)
 
 # ── Label vocabulary ──────────────────────────────────────────────────────────
-CLEAN_REAL_LABELS = frozenset({"clean", "missed_original", "phys_event"})
+CLEAN_REAL_LABELS = frozenset({"clean", "phys_event"})
 ARTIFACT_LABEL    = "artifact"
 
 # ── Category constants ────────────────────────────────────────────────────────
