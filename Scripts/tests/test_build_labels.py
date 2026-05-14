@@ -52,6 +52,10 @@ def test_build_labels_emits_subtype_and_drops_phys_event_window_and_in_bad_regio
     assert "phys_event_window" not in labels.columns
     assert "in_bad_region" not in labels.columns
     by_pid = labels.set_index("peak_id")
+    assert "segment_idx" in labels.columns
+    # segment_idx propagates from peaks_df
+    assert by_pid.loc[10, "segment_idx"] == 0
+    assert by_pid.loc[40, "segment_idx"] == 0
     assert by_pid.loc[10, "label"] == "clean"
     assert by_pid.loc[10, "subtype"] == "auto"
     assert by_pid.loc[20, "label"] == "artifact"

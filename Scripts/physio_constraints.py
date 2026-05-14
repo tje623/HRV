@@ -320,9 +320,12 @@ def build_pots_windows(labels_df: pd.DataFrame) -> list[tuple[int, int]]:
             merged.append((start, end))
 
     logger.info(
-        "Built %d POTS transition window(s) from %d phys_event block(s)",
+        "Built %d phys-event protection window(s) from %d phys_event block(s) "
+        "(each block buffered by ±%.0fs; protects PAC/PVC/vagal beats from "
+        "being flagged as physio-implausible)",
         len(merged),
         len(blocks),
+        POTS_TRANSITION_WINDOW_SEC,
     )
     return merged
 

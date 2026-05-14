@@ -1184,8 +1184,9 @@ def build_labels(
         diagnostics_dir: Optional directory for annotation/peak alignment CSVs.
 
     Returns:
-        DataFrame with columns: peak_id (int64), label (str),
-        subtype (str, "" for unmatched/unknown peaks), reviewed (bool).
+        DataFrame with columns: peak_id (int64), segment_idx (int32),
+        label (str), subtype (str, "" for unmatched/unknown peaks),
+        reviewed (bool).
     """
     peak_ts = peaks_df["timestamp_ms"].values.astype(np.int64)
     n_peaks = len(peak_ts)
@@ -1418,6 +1419,7 @@ def build_labels(
     result = pd.DataFrame(
         {
             "peak_id": peaks_df["peak_id"].values.astype(np.int64),
+            "segment_idx": peaks_df["segment_idx"].values.astype(np.int32),
             "label": labels,
             "subtype": subtypes,
             "reviewed": is_reviewed,
