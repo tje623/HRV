@@ -31,8 +31,24 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+
 plt = None
 Rectangle = None
+
+try:
+    from config import (
+        PHYSIO_CONSTRAINT_REVIEW_PEAKS_PQT,
+        MARKER_REVIEW_RECOVERY_PQT,
+        MARKER_CSV,
+    )
+except Exception:
+    PHYSIO_CONSTRAINT_REVIEW_PEAKS_PQT = Path("/Volumes/xHRV/Diagnostics/physio_constraint_review_peaks.parquet")
+    MARKER_REVIEW_RECOVERY_PQT = Path("/Volumes/xHRV/Diagnostics/marker_review_recovery_segments.parquet")
+    MARKER_CSV = Path("/Volumes/xHRV/Data/Accessory/Marker.csv")
 
 
 def require_matplotlib() -> None:
@@ -61,9 +77,9 @@ def require_matplotlib() -> None:
 
 ROOT = Path("/Volumes/xHRV")
 V4_DIR = ROOT / "Data/Annotations/V4"
-PROCESSED_DIR = ROOT / "Data/Processed"
-DEFAULT_ECG_DIR = ROOT / "Data/ECG"
-DEFAULT_PEAK_DIR = ROOT / "Data/Peaks"
+LEGACY_PROCESSED_DIR = ROOT / "Data/Processed"
+CURRENT_PROCESSED_DIR = ROOT / "Processed"
+PROCESSED_DIR = CURRENT_PROCESSED_DIR if CURRENT_PROCESSED_DIR.exists() else LEGACY_PROCESSED_DIR
 
 OUT_SEGMENTS = V4_DIR / "segments.parquet"
 OUT_BEATS = V4_DIR / "beats.parquet"
@@ -71,7 +87,8 @@ OUT_BAD = V4_DIR / "bad_regions.parquet"
 ACTION_LOG = V4_DIR / "v1_eval_action_history.txt"
 
 ECG_PARQUET = PROCESSED_DIR / "ecg_samples.parquet"
-PEAKS_PARQUET = PROCESSED_DIR / "/Volumes/xHRV/zArchive/Data/peaks.parquet"
+PEAKS_PARQUET = PROCESSED_DIR / "peaks.parquet"
+PROCESSED_SEGMENTS_PARQUET = PROCESSED_DIR / "segments.parquet"
 
 LOCAL_TZ = ZoneInfo("America/New_York")
 DISPLAY_MS = 60_000
@@ -85,9 +102,15 @@ ANNOTATION_MATCH_TOLERANCE_MS = 8
 ADDED_PEAK_SNAP_WINDOW_MS = 5
 PRECISE_ADDED_PEAK_SNAP_WINDOW_MS = 1
 WINDOW_CACHE_LIMIT = 48
+MAX_RR_TEXT_LABELS = 220
 DEFAULT_RMSSD_ARTIFACT_MS = 140.0
 DEFAULT_MIN_RR_ARTIFACT_MS = 300
 DEFAULT_PHYSIO_DELTA_MS = 350
+DEFAULT_REVIEW_WINDOW_MS = 12_000
+REVIEW_SHADE_MS = 130
+MARKER_FLANK_SEGMENTS = 15
+FEBRUARY_2025_START_MS = int(datetime(2025, 2, 1, tzinfo=timezone.utc).timestamp() * 1000)
+MARCH_2025_START_MS = int(datetime(2025, 3, 1, tzinfo=timezone.utc).timestamp() * 1000)
 
 BG = "#17213d"
 PANEL = "#0d111f"
@@ -97,6 +120,9 @@ ARTIFACT_COLOR = "#ff4f73"
 PHYSIO_COLOR = "#b46cff"
 ADDED_EDGE = "#fff2cf"
 BAD_REGION_COLOR = "#ff3d52"
+PAC_PVC_COLOR = "#ff89d6"
+PHYSIO_AFTEREFFECT_COLOR = "#5eead4"
+ARRHYTHMIA_COLOR = "#f9e76e"
 RR_BASE = (244, 207, 79)
 RR_DECREASE = (255, 79, 115)
 RR_INCREASE = (72, 202, 255)
@@ -135,6 +161,44 @@ BAD_COLUMNS = [
     "comment",
 ]
 
+PARQUET_SCHEMAS = {
+    "segments": pa.schema(
+        [
+            ("segment_idx", pa.int32()),
+            ("start_ms", pa.int64()),
+            ("end_ms", pa.int64()),
+            ("review_status", pa.string()),
+            ("segment_quality_label", pa.string()),
+            ("in_revisit_pile", pa.bool_()),
+            ("has_bad_region", pa.bool_()),
+            ("bad_region_count", pa.int32()),
+            ("beat_training_eligible_segment", pa.bool_()),
+            ("segment_quality_training_eligible", pa.bool_()),
+            ("comment", pa.string()),
+        ]
+    ),
+    "beats": pa.schema(
+        [
+            ("timestamp_ms", pa.int64()),
+            ("segment_idx", pa.int32()),
+            ("label", pa.string()),
+            ("subtype", pa.string()),
+            ("is_added_peak", pa.bool_()),
+            ("beat_training_eligible", pa.bool_()),
+            ("comment", pa.string()),
+        ]
+    ),
+    "bad": pa.schema(
+        [
+            ("segment_idx", pa.int32()),
+            ("region_idx_within_segment", pa.int32()),
+            ("start_ms", pa.int64()),
+            ("end_ms", pa.int64()),
+            ("original_annotation", pa.string()),
+            ("comment", pa.string()),
+        ]
+    ),
+}
 
 def _die(message: str) -> None:
     print(message, file=sys.stderr)
@@ -307,6 +371,34 @@ def load_parquet(path: Path) -> list[dict[str, Any]]:
     return duck_json(f"SELECT * FROM read_parquet('{q(path)}')")
 
 
+def load_optional_parquet(path: Path, columns: list[str]) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return normalize_rows(load_parquet(path), columns)
+
+
+def load_marker_timestamps(path: Path) -> list[int]:
+    if not path.exists():
+        alt = path.with_name(path.name.lower())
+        if alt.exists():
+            path = alt
+        else:
+            _die(f"Missing marker CSV: {path}")
+    timestamps: list[int] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        for row_idx, row in enumerate(reader):
+            if not row:
+                continue
+            value = str(row[0]).strip()
+            if not value:
+                continue
+            if row_idx == 0 and not value.lstrip("-").isdigit():
+                continue
+            timestamps.append(parse_timestamp_ms(value))
+    return sorted(set(timestamps))
+
+
 def merge_segment_rows(base_rows: list[dict[str, Any]], overlay_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[int, dict[str, Any]] = {int(row["segment_idx"]): dict(row) for row in base_rows}
     for row in overlay_rows:
@@ -342,74 +434,53 @@ def normalize_rows(rows: list[dict[str, Any]], columns: list[str]) -> list[dict[
     return out
 
 
+def normalize_processed_segment_row(row: dict[str, Any]) -> dict[str, Any]:
+    label = row.get("segment_quality_label", row.get("quality_label", "unknown"))
+    return {
+        "segment_idx": int(row["segment_idx"]),
+        "start_ms": int(row.get("start_ms", row.get("start_timestamp_ms"))),
+        "end_ms": int(row.get("end_ms", row.get("end_timestamp_ms"))),
+        "review_status": row.get("review_status") or "unreviewed",
+        "segment_quality_label": label or "unknown",
+        "in_revisit_pile": False,
+        "has_bad_region": False,
+        "bad_region_count": 0,
+        "beat_training_eligible_segment": bool_value(row.get("beat_training_eligible_segment")),
+        "segment_quality_training_eligible": bool_value(row.get("segment_quality_training_eligible")),
+        "comment": "",
+    }
+
+
 def write_parquet(path: Path, rows: list[dict[str, Any]], columns: list[str], table: str) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="v1_eval_", dir=str(path.parent)) as td:
-        csv_path = Path(td) / f"{table}.csv"
         tmp_out = Path(td) / f"{table}.parquet"
-        with csv_path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
-            writer.writeheader()
-            for row in rows:
-                cleaned: dict[str, Any] = {}
-                for col in columns:
-                    value = row.get(col, "")
-                    if isinstance(value, bool):
-                        value = "true" if value else "false"
-                    elif value is None:
-                        value = ""
-                    cleaned[col] = value
-                writer.writerow(cleaned)
-
-        if table == "segments":
-            select = """
-                SELECT
-                    CAST(segment_idx AS INTEGER) AS segment_idx,
-                    CAST(start_ms AS BIGINT) AS start_ms,
-                    CAST(end_ms AS BIGINT) AS end_ms,
-                    CAST(review_status AS VARCHAR) AS review_status,
-                    CAST(segment_quality_label AS VARCHAR) AS segment_quality_label,
-                    CAST(in_revisit_pile AS BOOLEAN) AS in_revisit_pile,
-                    CAST(has_bad_region AS BOOLEAN) AS has_bad_region,
-                    CAST(bad_region_count AS INTEGER) AS bad_region_count,
-                    CAST(beat_training_eligible_segment AS BOOLEAN) AS beat_training_eligible_segment,
-                    CAST(segment_quality_training_eligible AS BOOLEAN) AS segment_quality_training_eligible,
-                    CAST(comment AS VARCHAR) AS comment
-                FROM read_csv_auto('{csv}', HEADER=TRUE)
-            """
-        elif table == "beats":
-            select = """
-                SELECT
-                    CAST(timestamp_ms AS BIGINT) AS timestamp_ms,
-                    CAST(segment_idx AS INTEGER) AS segment_idx,
-                    CAST(label AS VARCHAR) AS label,
-                    CAST(subtype AS VARCHAR) AS subtype,
-                    CAST(is_added_peak AS BOOLEAN) AS is_added_peak,
-                    CAST(beat_training_eligible AS BOOLEAN) AS beat_training_eligible,
-                    CAST(comment AS VARCHAR) AS comment
-                FROM read_csv_auto('{csv}', HEADER=TRUE)
-            """
-        elif table == "bad":
-            select = """
-                SELECT
-                    CAST(segment_idx AS INTEGER) AS segment_idx,
-                    CAST(region_idx_within_segment AS INTEGER) AS region_idx_within_segment,
-                    CAST(start_ms AS BIGINT) AS start_ms,
-                    CAST(end_ms AS BIGINT) AS end_ms,
-                    CAST(original_annotation AS VARCHAR) AS original_annotation,
-                    CAST(comment AS VARCHAR) AS comment
-                FROM read_csv_auto('{csv}', HEADER=TRUE)
-            """
-        else:
-            raise ValueError(table)
-
-        sql = f"COPY ({select.format(csv=q(csv_path))}) TO '{q(tmp_out)}' (FORMAT PARQUET)"
-        duck_exec(sql)
+        schema = PARQUET_SCHEMAS[table]
+        cleaned_rows = []
+        for row in rows:
+            cleaned: dict[str, Any] = {}
+            for field in schema:
+                value = row.get(field.name)
+                if pa.types.is_boolean(field.type):
+                    value = bool_value(value)
+                elif pa.types.is_integer(field.type):
+                    value = int(value) if value not in {None, ""} else None
+                elif pa.types.is_string(field.type):
+                    value = "" if value is None else str(value)
+                cleaned[field.name] = value
+            cleaned_rows.append(cleaned)
+        out_table = pa.Table.from_pylist(cleaned_rows, schema=schema)
+        pq.write_table(out_table, tmp_out, compression="zstd")
         tmp_out.replace(path)
 
 
 def ms_to_local(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_february_2025_ms(ms: int) -> bool:
+    return FEBRUARY_2025_START_MS <= int(ms) < MARCH_2025_START_MS
 
 
 def blend(base: tuple[int, int, int], target: tuple[int, int, int], amount: float) -> str:
@@ -428,6 +499,7 @@ class PeakPoint:
     label: str
     subtype: str = ""
     raw_timestamp_ms: int | None = None
+    segment_idx: int | None = None
 
 
 @dataclass
@@ -505,15 +577,22 @@ class ActionLogger:
         )
 
     def log(self, action: str, segment_idx: int | None = None, details: dict[str, Any] | None = None) -> None:
+        details = details or {}
         record = {
             "ts_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "session_id": self.session_id,
             "action": action,
             "segment_idx": segment_idx,
-            "details": details or {},
+            "details": details,
         }
         line = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
-        print(f"[v1_eval_action] {line}", flush=True)
+        summary_bits = [f"action={action}"]
+        if segment_idx is not None:
+            summary_bits.append(f"segment={segment_idx}")
+        for key in ("count", "restored_kind", "reason"):
+            if key in details:
+                summary_bits.append(f"{key}={details[key]}")
+        print("[v1_eval_action] " + " ".join(summary_bits), flush=True)
         self.handle.write(line + "\n")
         self.handle.flush()
 
@@ -532,40 +611,91 @@ class MasterAnnotationViewer:
         self.segments = normalize_rows(segment_rows, SEGMENT_COLUMNS)
         self.beats = normalize_rows(load_parquet(OUT_BEATS), BEAT_COLUMNS)
         self.bad_regions = normalize_rows(load_parquet(OUT_BAD), BAD_COLUMNS)
-
         self.segment_by_idx = {int(r["segment_idx"]): r for r in self.segments}
+        self.processed_segment_by_idx: dict[int, dict[str, Any]] = {}
+        self.timestamp_segment_cache: dict[int, int] = {}
+        self.physio_review_table = None
+        self.physio_review_total = 0
+        self.physio_review_segment_cache: dict[int, dict[str, Any]] = {}
+        self.physio_review_row_cache: dict[int, dict[str, Any]] = {}
+        self.recovery_queue_mode = False
+        self.marker_groups: dict[int, list[int]] = {}
+        self.marker_order: list[int] = []
+        self.marker_position: int = 0
         self.beats_by_segment: dict[int, list[dict[str, Any]]] = {}
+        self.added_beats_by_timestamp: list[tuple[int, dict[str, Any]]] = []
         for row in self.beats:
             seg_idx = int(row["segment_idx"])
             self.beats_by_segment.setdefault(seg_idx, []).append(row)
+        self._rebuild_added_beat_index()
         self.bad_by_segment: dict[int, list[dict[str, Any]]] = {}
         for row in self.bad_regions:
             seg_idx = int(row["segment_idx"])
             self.bad_by_segment.setdefault(seg_idx, []).append(row)
+        self.physio_reviewed_segment_idxs = {
+            int(row["segment_idx"])
+            for row in self.segments
+            if str(row.get("review_status") or "") == "reviewed"
+        }
 
-        self.segment_metrics = self._load_segment_metrics()
         self.segment_group_by_idx: dict[int, str] = {}
+        self.segment_metrics: dict[int, SegmentMetrics] = {}
+        if self._needs_segment_metrics():
+            self.segment_metrics = self._load_segment_metrics()
         self._refresh_all_segment_groups()
+        self.ecg_dataset = ds.dataset(ECG_PARQUET, format="parquet") if ECG_PARQUET.exists() else None
+        self.peaks_dataset = ds.dataset(PEAKS_PARQUET, format="parquet") if PEAKS_PARQUET.exists() else None
+        if getattr(args, "physio_review", False):
+            self.physio_review_total = self._load_physio_review_index()
 
-        self.visible_segments = self._select_segments()
-        if not self.visible_segments:
-            _die("No segments matched the requested mode.")
-
-        self.index = max(0, min(int(args.start), len(self.visible_segments) - 1))
+        self.index = max(0, int(args.start))
+        if getattr(args, "marker_recovery", False):
+            self.visible_segments = self._load_marker_recovery_queue()
+            if not self.visible_segments:
+                _die("No marker recovery rows found.")
+            self.recovery_queue_mode = True
+            self.index = min(self.index, len(self.visible_segments) - 1)
+        elif getattr(args, "markers", False):
+            self.visible_segments = self._load_marker_windows()
+            if not self.visible_segments:
+                _die("No marker windows found.")
+            self._build_marker_navigation()
+            start_marker_pos = self._find_next_marker_position(max(0, int(args.start)), 1)
+            if start_marker_pos is None:
+                _die("No unreviewed marker-center segments remain.")
+            self.marker_position = start_marker_pos
+            self.index = self._marker_center_index(self.marker_order[self.marker_position])
+        elif getattr(args, "physio_review", False):
+            if self.physio_review_total <= 0:
+                _die("No physio review beats matched.")
+            self.index = min(self.index, self.physio_review_total - 1)
+            self.index = self._find_physio_review_index(self.index, 1, skip_reviewed=True)
+            if self.index is None:
+                _die("No unreviewed physio review beats remain.")
+            self.visible_segments = [self._physio_review_row_at(self.index)]
+        else:
+            self.visible_segments = self._select_segments()
+            if not self.visible_segments:
+                _die("No segments matched the requested mode.")
+            self.index = min(self.index, len(self.visible_segments) - 1)
         self.view_lo_ms: int | None = None
         self.view_hi_ms: int | None = None
+        self.loaded_lo_ms: int | None = None
+        self.loaded_hi_ms: int | None = None
         self.ecg_ms: list[int] = []
         self.ecg_y: list[float] = []
         self.current_peak_rows: list[dict[str, Any]] = []
         self.display_points: list[PeakPoint] = []
-        self.window_cache: dict[int, tuple[list[int], list[float], list[dict[str, Any]]]] = {}
-        self.window_cache_order: list[int] = []
+        self.window_cache: dict[tuple[int, int, int], tuple[list[int], list[float], list[dict[str, Any]]]] = {}
+        self.window_cache_order: list[tuple[int, int, int]] = []
 
         self.undo_stack: list[dict[str, Any]] = []
         self.redo_stack: list[dict[str, Any]] = []
         self.mode = "browse"
         self.bad_region_start_ms: int | None = None
+        self.physio_region_start_ms: int | None = None
         self.last_b_time = 0.0
+        self.last_p_time = 0.0
         self.last_b_revert: tuple[int, str, bool, bool] | None = None
         self.comment_active = False
         self.comment_buffer = ""
@@ -578,7 +708,8 @@ class MasterAnnotationViewer:
             {
                 "script": str(Path(__file__)),
                 "queue": self._requested_queue_group() or "default",
-                "selected_segments": len(self.visible_segments),
+                "physio_review": bool(getattr(self.args, "physio_review", False)),
+                "selected_segments": self._queue_size(),
                 "log_path": str(ACTION_LOG),
             },
         )
@@ -596,6 +727,311 @@ class MasterAnnotationViewer:
         if not self.visible_segments:
             _die(self.status or "No non-empty ECG windows matched the requested mode. Use --show-empty to inspect empty rows.")
         self._draw()
+
+    def _load_physio_review_index(self) -> int:
+        if not getattr(self.args, "physio_review", False):
+            return 0
+        path = Path(PHYSIO_CONSTRAINT_REVIEW_PEAKS_PQT)
+        if not path.exists():
+            _die(f"Missing physio review peaks parquet: {path}")
+
+        table = pq.read_table(
+            path,
+            columns=["segment_idx", "peak_id", "timestamp_ms", "assigned_label"],
+        ).combine_chunks()
+        original_total = table.num_rows
+        february_skipped = 0
+        timestamp = table.column("timestamp_ms")
+        keep = pc.or_(
+            pc.less(timestamp, FEBRUARY_2025_START_MS),
+            pc.greater_equal(timestamp, MARCH_2025_START_MS),
+        )
+        table = table.filter(keep).combine_chunks()
+        february_skipped = original_total - table.num_rows
+        total = table.num_rows
+        if total == 0:
+            _die(f"No review beats found in physio review peaks parquet: {path}")
+        if bool(getattr(self.args, "spread_queue", True)):
+            table = self._spread_physio_review_table(table)
+            total = table.num_rows
+        self.physio_review_table = table
+        suffix = f" ({february_skipped:,} February 2025 rows excluded)" if february_skipped else ""
+        print(f"Loaded physio review index: {total:,} beats from {path}{suffix}", flush=True)
+        return total
+
+    def _load_marker_windows(self) -> list[dict[str, Any]]:
+        timestamps = load_marker_timestamps(Path(MARKER_CSV))
+        if not timestamps:
+            return []
+        marker_values = ",\n".join(
+            f"({idx}, {int(ts)})" for idx, ts in enumerate(timestamps, start=1)
+        )
+        processed_rows = duck_json(
+            f"""
+            WITH markers(marker_idx, marker_timestamp_ms) AS (
+                VALUES {marker_values}
+            ),
+            segments AS (
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY start_timestamp_ms, segment_idx) - 1 AS rn,
+                    CAST(segment_idx AS INTEGER) AS segment_idx,
+                    CAST(start_timestamp_ms AS BIGINT) AS start_timestamp_ms,
+                    CAST(end_timestamp_ms AS BIGINT) AS end_timestamp_ms,
+                    CAST(review_status AS VARCHAR) AS review_status,
+                    CAST(quality_label AS VARCHAR) AS quality_label,
+                    CAST(beat_training_eligible_segment AS BOOLEAN) AS beat_training_eligible_segment,
+                    CAST(segment_quality_training_eligible AS BOOLEAN) AS segment_quality_training_eligible
+                FROM read_parquet('{q(PROCESSED_SEGMENTS_PARQUET)}')
+            ),
+            marker_centers AS (
+                SELECT
+                    m.marker_idx,
+                    m.marker_timestamp_ms,
+                    s.rn AS center_rn,
+                    s.segment_idx AS center_segment_idx
+                FROM markers m
+                JOIN LATERAL (
+                    SELECT rn, segment_idx
+                    FROM segments s
+                    ORDER BY
+                        CASE
+                            WHEN m.marker_timestamp_ms BETWEEN s.start_timestamp_ms AND s.end_timestamp_ms THEN 0
+                            ELSE 1
+                        END,
+                        ABS(((s.start_timestamp_ms + s.end_timestamp_ms) / 2) - m.marker_timestamp_ms)
+                    LIMIT 1
+                ) s ON TRUE
+            ),
+            marker_segments AS (
+                SELECT
+                    c.marker_idx,
+                    c.marker_timestamp_ms,
+                    c.center_segment_idx,
+                    CAST(s.rn - c.center_rn AS INTEGER) AS marker_offset,
+                    s.*
+                FROM marker_centers c
+                JOIN segments s
+                    ON s.rn BETWEEN c.center_rn - {MARKER_FLANK_SEGMENTS}
+                        AND c.center_rn + {MARKER_FLANK_SEGMENTS}
+            )
+            SELECT *
+            FROM marker_segments
+            ORDER BY marker_idx, marker_offset
+            """
+        )
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[int, int]] = set()
+        skipped_reviewed = 0
+        for raw in processed_rows:
+            seg_idx = int(raw["segment_idx"])
+            marker_idx = int(raw["marker_idx"])
+            key = (marker_idx, seg_idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            row = self.segment_by_idx.get(seg_idx)
+            if row is None:
+                row = normalize_processed_segment_row(raw)
+            else:
+                row = dict(row)
+            if str(row.get("review_status") or "") == "reviewed":
+                skipped_reviewed += 1
+                continue
+            row["_marker_idx"] = marker_idx
+            row["_marker_timestamp_ms"] = int(raw["marker_timestamp_ms"])
+            row["_marker_center_segment_idx"] = int(raw["center_segment_idx"])
+            row["_marker_offset"] = int(raw["marker_offset"])
+            rows.append(row)
+        suffix = f" ({skipped_reviewed:,} already-reviewed segments excluded)" if skipped_reviewed else ""
+        print(
+            f"Loaded marker segments: {len(rows):,} rows from {len(timestamps):,} marker(s) "
+            f"(±{MARKER_FLANK_SEGMENTS} segments each) via {MARKER_CSV}{suffix}",
+            flush=True,
+        )
+        return rows
+
+    def _load_marker_recovery_queue(self) -> list[dict[str, Any]]:
+        path = Path(MARKER_REVIEW_RECOVERY_PQT)
+        if not path.exists():
+            _die(f"Missing marker recovery parquet: {path}")
+        rows = load_parquet(path)
+        out: list[dict[str, Any]] = []
+        for raw in rows:
+            seg_idx = int(raw["segment_idx"])
+            row = self.segment_by_idx.get(seg_idx)
+            if row is None:
+                row = {col: raw.get(col) for col in SEGMENT_COLUMNS}
+            else:
+                row = dict(row)
+            if str(row.get("review_status") or "") == "reviewed":
+                continue
+            if str(row.get("review_status") or "") == "revisit" or bool_value(row.get("in_revisit_pile")):
+                continue
+            for key in (
+                "_marker_idx",
+                "_marker_timestamp_ms",
+                "_marker_center_segment_idx",
+                "_marker_offset",
+                "_direct_action_count",
+                "_direct_actions",
+            ):
+                row[key] = raw.get(key)
+            out.append(row)
+        print(f"Loaded marker recovery queue: {len(out):,} rows from {path}", flush=True)
+        return out
+
+    def _build_marker_navigation(self) -> None:
+        self.marker_groups = {}
+        for idx, row in enumerate(self.visible_segments):
+            marker_idx = int(row.get("_marker_idx") or 0)
+            if marker_idx <= 0:
+                continue
+            self.marker_groups.setdefault(marker_idx, []).append(idx)
+        for indices in self.marker_groups.values():
+            indices.sort(key=lambda i: int_or_none(self.visible_segments[i].get("_marker_offset")) or 0)
+        self.marker_order = sorted(self.marker_groups)
+
+    def _marker_center_index(self, marker_idx: int) -> int:
+        indices = self.marker_groups.get(int(marker_idx), [])
+        if not indices:
+            return 0
+        return min(
+            indices,
+            key=lambda i: abs(int_or_none(self.visible_segments[i].get("_marker_offset")) or 0),
+        )
+
+    def _marker_center_row(self, marker_idx: int) -> dict[str, Any] | None:
+        if int(marker_idx) not in self.marker_groups:
+            return None
+        return self.visible_segments[self._marker_center_index(int(marker_idx))]
+
+    def _marker_center_done(self, marker_idx: int) -> bool:
+        row = self._marker_center_row(marker_idx)
+        if row is None:
+            return True
+        seg_idx = int(row["segment_idx"])
+        live = self.segment_by_idx.get(seg_idx, row)
+        return str(live.get("review_status")) == "reviewed" or bool_value(live.get("in_revisit_pile")) or str(live.get("review_status")) == "revisit"
+
+    def _find_next_marker_position(self, start_pos: int, direction: int) -> int | None:
+        if not self.marker_order:
+            return None
+        step = 1 if direction >= 0 else -1
+        pos = max(0, min(len(self.marker_order) - 1, int(start_pos)))
+        while 0 <= pos < len(self.marker_order):
+            if not self._marker_center_done(self.marker_order[pos]):
+                return pos
+            pos += step
+        return None
+
+    def _spread_physio_review_table(self, table: Any) -> Any:
+        total = int(table.num_rows)
+        if total <= 2:
+            return table
+        step = max(total // 97, 1)
+        while math.gcd(step, total) != 1:
+            step += 1
+        order = [(idx * step) % total for idx in range(total)]
+        return table.take(pa.array(order, type=pa.int64())).combine_chunks()
+
+    def _physio_review_segment_idx_at_index(self, idx: int) -> int:
+        if self.physio_review_table is None:
+            raise RuntimeError("physio review index has not been loaded")
+        return int(self.physio_review_table.column("segment_idx")[idx].as_py())
+
+    def _find_physio_review_index(self, start_idx: int, direction: int, skip_reviewed: bool = False) -> int | None:
+        if self.physio_review_total <= 0:
+            return None
+        step = 1 if direction >= 0 else -1
+        idx = max(0, min(self.physio_review_total - 1, int(start_idx)))
+        while 0 <= idx < self.physio_review_total:
+            seg_idx = self._physio_review_segment_idx_at_index(idx)
+            if not skip_reviewed or seg_idx not in self.physio_reviewed_segment_idxs:
+                return idx
+            idx += step
+        return None
+
+    def _load_processed_segment_row(self, seg_idx: int) -> dict[str, Any] | None:
+        cached = self.physio_review_segment_cache.get(seg_idx)
+        if cached is not None:
+            return cached
+        if not PROCESSED_SEGMENTS_PARQUET.exists():
+            return None
+        rows = duck_json(
+            f"""
+            SELECT
+                CAST(segment_idx AS INTEGER) AS segment_idx,
+                CAST(start_timestamp_ms AS BIGINT) AS start_timestamp_ms,
+                CAST(end_timestamp_ms AS BIGINT) AS end_timestamp_ms,
+                CAST(review_status AS VARCHAR) AS review_status,
+                CAST(quality_label AS VARCHAR) AS quality_label,
+                CAST(beat_training_eligible_segment AS BOOLEAN) AS beat_training_eligible_segment,
+                CAST(segment_quality_training_eligible AS BOOLEAN) AS segment_quality_training_eligible
+            FROM read_parquet('{q(PROCESSED_SEGMENTS_PARQUET)}')
+            WHERE segment_idx = {int(seg_idx)}
+            LIMIT 1
+            """
+        )
+        if not rows:
+            return None
+        row = normalize_processed_segment_row(rows[0])
+        self.physio_review_segment_cache[seg_idx] = row
+        return row
+
+    def _physio_review_row_at(self, idx: int) -> dict[str, Any]:
+        cached = self.physio_review_row_cache.get(idx)
+        if cached is not None:
+            return cached
+        if self.physio_review_table is None:
+            raise RuntimeError("physio review index has not been loaded")
+        table = self.physio_review_table
+        seg_idx = int(table.column("segment_idx")[idx].as_py())
+        base = self.segment_by_idx.get(seg_idx) or self._load_processed_segment_row(seg_idx)
+        if base is None:
+            base = {
+                "segment_idx": seg_idx,
+                "start_ms": int(table.column("timestamp_ms")[idx].as_py()) - DISPLAY_MS // 2,
+                "end_ms": int(table.column("timestamp_ms")[idx].as_py()) + DISPLAY_MS // 2,
+                "review_status": "unreviewed",
+                "segment_quality_label": "unknown",
+                "in_revisit_pile": False,
+                "has_bad_region": False,
+                "bad_region_count": 0,
+                "beat_training_eligible_segment": False,
+                "segment_quality_training_eligible": False,
+                "comment": "",
+            }
+        row = dict(base)
+        row["_review_peak_id"] = int(table.column("peak_id")[idx].as_py())
+        row["_review_peak_timestamp_ms"] = int(table.column("timestamp_ms")[idx].as_py())
+        row["_review_assigned_label"] = str(table.column("assigned_label")[idx].as_py() or "")
+        self.physio_review_row_cache[idx] = row
+        if len(self.physio_review_row_cache) > WINDOW_CACHE_LIMIT * 4:
+            for old_idx in sorted(self.physio_review_row_cache)[:WINDOW_CACHE_LIMIT]:
+                self.physio_review_row_cache.pop(old_idx, None)
+        return row
+
+    def _load_processed_segment_index(self) -> dict[int, dict[str, Any]]:
+        if not PROCESSED_SEGMENTS_PARQUET.exists():
+            return {}
+        rows = duck_json(
+            f"""
+            SELECT
+                CAST(segment_idx AS INTEGER) AS segment_idx,
+                CAST(start_timestamp_ms AS BIGINT) AS start_timestamp_ms,
+                CAST(end_timestamp_ms AS BIGINT) AS end_timestamp_ms,
+                CAST(review_status AS VARCHAR) AS review_status,
+                CAST(quality_label AS VARCHAR) AS quality_label,
+                CAST(beat_training_eligible_segment AS BOOLEAN) AS beat_training_eligible_segment,
+                CAST(segment_quality_training_eligible AS BOOLEAN) AS segment_quality_training_eligible
+            FROM read_parquet('{q(PROCESSED_SEGMENTS_PARQUET)}')
+            ORDER BY start_timestamp_ms
+            """
+        )
+        return {
+            int(row["segment_idx"]): normalize_processed_segment_row(row)
+            for row in rows
+        }
 
     def _load_segment_metrics(self) -> dict[int, SegmentMetrics]:
         if not PEAKS_PARQUET.exists():
@@ -663,12 +1099,12 @@ class MasterAnnotationViewer:
                     ELSE 0
                 END), 0) AS has_rr_drop_gt_20,
                 COALESCE(MAX(CASE
-                    WHEN prev_rr_ms > 0 AND delta_rr_ms > 0 AND delta_rr_ms < {int(self.args.physio_delta_ms)}
+                    WHEN prev_rr_ms > 0 AND delta_rr_ms > 0 AND delta_rr_ms < {int(self.args.delta)}
                         AND delta_rr_ms::DOUBLE / prev_rr_ms::DOUBLE > 0.20 THEN 1
                     ELSE 0
                 END), 0) AS has_rr_rise_gt_20_nonphysio,
                 COALESCE(MAX(CASE
-                    WHEN delta_rr_ms >= {int(self.args.physio_delta_ms)} THEN 1
+                    WHEN delta_rr_ms >= {int(self.args.delta)} THEN 1
                     ELSE 0
                 END), 0) AS has_physio_rise
             FROM rr
@@ -705,12 +1141,17 @@ class MasterAnnotationViewer:
         return False
 
     def _refresh_segment_group(self, seg_idx: int) -> None:
+        if not self.segment_metrics:
+            self.segment_group_by_idx[seg_idx] = (
+                "annotated" if self._segment_has_annotations(seg_idx) else "likely-clean"
+            )
+            return
         self.segment_group_by_idx[seg_idx] = classify_segment_queue(
             self._segment_has_annotations(seg_idx),
             self.segment_metrics.get(seg_idx),
-            rmssd_artifact_ms=float(self.args.rmssd_artifact_ms),
-            min_rr_artifact_ms=int(self.args.min_rr_artifact_ms),
-            physio_delta_ms=int(self.args.physio_delta_ms),
+            rmssd_artifact_ms=float(self.args.rmssd),
+            min_rr_artifact_ms=int(self.args.min_rr),
+            physio_delta_ms=int(self.args.delta),
         )
 
     def _refresh_all_segment_groups(self) -> None:
@@ -728,8 +1169,12 @@ class MasterAnnotationViewer:
                 return group
         return None
 
+    def _needs_segment_metrics(self) -> bool:
+        return self._requested_queue_group() in {"likely-artifact", "likely-physio", "likely-clean"}
+
     def _base_selected_segments(self) -> list[dict[str, Any]]:
         rows = sorted(self.segments, key=lambda r: int(r["start_ms"]))
+        rows = [r for r in rows if not is_february_2025_ms(int(r["start_ms"]))]
         if self.args.reviewed:
             return [r for r in rows if str(r.get("review_status")) == "reviewed"]
         if self.args.usable:
@@ -739,12 +1184,35 @@ class MasterAnnotationViewer:
         if self.args.unusable:
             return [r for r in rows if str(r.get("segment_quality_label")) == "unusable"]
         if self.args.physio:
-            physio_segments = {
+            physio_segment_ids = {
                 int(b["segment_idx"]) for b in self.beats
                 if str(b.get("label")) == "physio"
             }
-            return [r for r in rows if int(r["segment_idx"]) in physio_segments]
+            return [r for r in rows if int(r["segment_idx"]) in physio_segment_ids]
         return rows
+
+    def _spread_temporal_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not bool(getattr(self.args, "spread_queue", True)) or len(rows) <= 2:
+            return rows
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for row in sorted(rows, key=lambda r: int(r["start_ms"])):
+            key = datetime.fromtimestamp(int(row["start_ms"]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            buckets.setdefault(key, []).append(row)
+        ordered_keys = sorted(buckets)
+        if len(ordered_keys) <= 1:
+            return rows
+        out: list[dict[str, Any]] = []
+        remaining = True
+        offset = 0
+        while remaining:
+            remaining = False
+            for key in ordered_keys:
+                bucket = buckets[key]
+                if offset < len(bucket):
+                    out.append(bucket[offset])
+                    remaining = True
+            offset += 1
+        return out
 
     def _sort_segments_for_group(self, rows: list[dict[str, Any]], group: str | None) -> list[dict[str, Any]]:
         if group == "likely-clean":
@@ -777,12 +1245,26 @@ class MasterAnnotationViewer:
         return rows
 
     def _select_segments(self) -> list[dict[str, Any]]:
+        if getattr(self.args, "marker_recovery", False):
+            rows = []
+            for row in self.visible_segments:
+                live = self.segment_by_idx.get(int(row["segment_idx"]), row)
+                if str(live.get("review_status") or "") == "reviewed":
+                    continue
+                if str(live.get("review_status") or "") == "revisit" or bool_value(live.get("in_revisit_pile")):
+                    continue
+                rows.append(row)
+            return rows
+        if getattr(self.args, "markers", False):
+            return list(self.visible_segments)
+        if getattr(self.args, "physio_review", False):
+            return [self._physio_review_row_at(self.index)]
         rows = self._base_selected_segments()
         group = self._requested_queue_group()
         if group is None:
-            return rows
+            return self._spread_temporal_rows(rows)
         filtered = [r for r in rows if self.segment_group_by_idx.get(int(r["segment_idx"])) == group]
-        return self._sort_segments_for_group(filtered, group)
+        return self._spread_temporal_rows(self._sort_segments_for_group(filtered, group))
 
     def _queue_counts(self) -> dict[str, int]:
         counts = {"annotated": 0, "likely-artifact": 0, "likely-physio": 0, "likely-clean": 0}
@@ -792,6 +1274,16 @@ class MasterAnnotationViewer:
         return counts
 
     def _print_queue_summary(self) -> None:
+        if getattr(self.args, "physio_review", False):
+            summary = f"Physio review queue: {self.physio_review_total:,} flagged beats"
+            print(summary, flush=True)
+            self.action_logger.log("physio_review_queue_summary", details={"beats": self.physio_review_total})
+            return
+        if not self.segment_metrics and self._requested_queue_group() is None:
+            summary = f"Selected queue: {self._queue_size():,} segments"
+            print(summary, flush=True)
+            self.action_logger.log("queue_summary", details={"selected_segments": self._queue_size()})
+            return
         counts = self._queue_counts()
         summary = (
             "Queue groups for current base selection: "
@@ -803,29 +1295,76 @@ class MasterAnnotationViewer:
         print(summary, flush=True)
         self.action_logger.log("queue_summary", details=counts)
 
+    def _queue_size(self) -> int:
+        if getattr(self.args, "physio_review", False):
+            return self.physio_review_total
+        if getattr(self.args, "markers", False):
+            return len(self.marker_order)
+        return len(self.visible_segments)
+
+    def _display_review_status(self, seg: dict[str, Any]) -> str:
+        if getattr(self.args, "physio_review", False):
+            row = self.segment_by_idx.get(int(seg["segment_idx"]), seg)
+            return f"physio-{row.get('review_status') or 'unreviewed'}"
+        return str(seg.get("review_status") or "unreviewed")
+
     def current_segment(self) -> dict[str, Any]:
+        if getattr(self.args, "physio_review", False):
+            return self._physio_review_row_at(self.index)
         return self.visible_segments[self.index]
 
     def _segment_idx(self) -> int:
         return int(self.current_segment()["segment_idx"])
+
+    def _real_segment_idx_for_timestamp(self, timestamp_ms: int) -> int:
+        cached = self.timestamp_segment_cache.get(int(timestamp_ms))
+        if cached is not None:
+            return cached
+        if not PROCESSED_SEGMENTS_PARQUET.exists():
+            return self._segment_idx()
+        rows = duck_json(
+            f"""
+            SELECT CAST(segment_idx AS INTEGER) AS segment_idx
+            FROM read_parquet('{q(PROCESSED_SEGMENTS_PARQUET)}')
+            WHERE CAST(start_timestamp_ms AS BIGINT) <= {int(timestamp_ms)}
+                AND CAST(end_timestamp_ms AS BIGINT) >= {int(timestamp_ms)}
+            LIMIT 1
+            """
+        )
+        if rows:
+            seg_idx = int(rows[0]["segment_idx"])
+        else:
+            seg_idx = self._segment_idx()
+        self.timestamp_segment_cache[int(timestamp_ms)] = seg_idx
+        return seg_idx
+
+    def _point_segment_idx(self, point: PeakPoint) -> int:
+        if point.segment_idx is not None:
+            return int(point.segment_idx)
+        if getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False):
+            return self._real_segment_idx_for_timestamp(self._point_identity_ts(point))
+        return self._segment_idx()
 
     def _load_window(self, reset_view: bool = False) -> None:
         seg = self.current_segment()
         seg_idx = int(seg["segment_idx"])
         start_ms = int(seg["start_ms"])
         end_ms = int(seg["end_ms"])
-        cached = self.window_cache.get(seg_idx)
+        load_start_ms, load_end_ms = self._window_bounds(seg, start_ms, end_ms)
+        self.loaded_lo_ms = load_start_ms
+        self.loaded_hi_ms = load_end_ms
+        cache_key = (seg_idx, load_start_ms, load_end_ms)
+        cached = self.window_cache.get(cache_key)
         if cached is not None:
             self.ecg_ms = list(cached[0])
             self.ecg_y = list(cached[1])
             self.current_peak_rows = [dict(r) for r in cached[2]]
             if reset_view or self.view_lo_ms is None or self.view_hi_ms is None:
-                self.view_lo_ms = start_ms
-                self.view_hi_ms = end_ms
+                self._set_review_or_segment_view(seg, start_ms, end_ms)
             return
 
-        self.ecg_ms, self.ecg_y = self._load_ecg(start_ms, end_ms)
-        self.current_peak_rows = self._load_current_peaks(start_ms, end_ms)
+        self.ecg_ms, self.ecg_y = self._load_ecg(load_start_ms, load_end_ms)
+        self.current_peak_rows = self._load_current_peaks(load_start_ms, load_end_ms)
         if not self.ecg_ms:
             fallback_ecg_ms, fallback_ecg_y = self._load_ecg_by_segment(seg_idx)
             if fallback_ecg_ms:
@@ -841,25 +1380,55 @@ class MasterAnnotationViewer:
                 if not self.status:
                     self.status = f"Loaded Segment {seg_idx} by current segment_idx timestamps"
         if reset_view or self.view_lo_ms is None or self.view_hi_ms is None:
-            self.view_lo_ms = start_ms
-            self.view_hi_ms = end_ms
-        self._cache_window(seg_idx)
+            self._set_review_or_segment_view(seg, start_ms, end_ms)
+        self._cache_window(cache_key)
 
-    def _cache_window(self, seg_idx: int) -> None:
-        self.window_cache[seg_idx] = (
+    def _set_review_or_segment_view(self, seg: dict[str, Any], start_ms: int, end_ms: int) -> None:
+        self.view_lo_ms, self.view_hi_ms = self._window_bounds(seg, start_ms, end_ms)
+
+    def _requested_window_ms(self, seg: dict[str, Any], start_ms: int, end_ms: int) -> int:
+        requested = getattr(self.args, "window_size", None)
+        if requested is not None:
+            return max(MIN_VIEW_MS, int(round(float(requested) * 1000)))
+        review_ts = int_or_none(seg.get("_review_peak_timestamp_ms"))
+        if review_ts is not None:
+            return max(DEFAULT_REVIEW_WINDOW_MS, MIN_VIEW_MS)
+        return max(end_ms - start_ms, MIN_VIEW_MS)
+
+    def _window_center_ms(self, seg: dict[str, Any], start_ms: int, end_ms: int) -> int:
+        review_ts = int_or_none(seg.get("_review_peak_timestamp_ms"))
+        if review_ts is not None:
+            return review_ts
+        if getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False):
+            return (start_ms + end_ms) // 2
+        marker_ts = int_or_none(seg.get("_marker_timestamp_ms"))
+        marker_offset = int_or_none(seg.get("_marker_offset"))
+        if marker_ts is not None and marker_offset == 0:
+            return marker_ts
+        return (start_ms + end_ms) // 2
+
+    def _window_bounds(self, seg: dict[str, Any], start_ms: int, end_ms: int) -> tuple[int, int]:
+        width_ms = self._requested_window_ms(seg, start_ms, end_ms)
+        center_ms = self._window_center_ms(seg, start_ms, end_ms)
+        lo = center_ms - width_ms // 2
+        hi = lo + width_ms
+        return int(lo), int(hi)
+
+    def _cache_window(self, cache_key: tuple[int, int, int]) -> None:
+        self.window_cache[cache_key] = (
             list(self.ecg_ms),
             list(self.ecg_y),
             [dict(r) for r in self.current_peak_rows],
         )
-        if seg_idx in self.window_cache_order:
-            self.window_cache_order.remove(seg_idx)
-        self.window_cache_order.append(seg_idx)
+        if cache_key in self.window_cache_order:
+            self.window_cache_order.remove(cache_key)
+        self.window_cache_order.append(cache_key)
         while len(self.window_cache_order) > WINDOW_CACHE_LIMIT:
             old = self.window_cache_order.pop(0)
             self.window_cache.pop(old, None)
 
     def _skip_empty_windows(self, direction: int) -> None:
-        if self.args.show_empty:
+        if getattr(self.args, "physio_review", False):
             return
         if not self.visible_segments:
             return
@@ -881,54 +1450,64 @@ class MasterAnnotationViewer:
             self.status = f"Skipped empty Segment {skipped}"
 
     def _load_ecg(self, start_ms: int, end_ms: int) -> tuple[list[int], list[float]]:
-        if not ECG_PARQUET.exists():
+        if self.ecg_dataset is None:
             return [], []
-        rows = duck_json(
-            f"""
-            SELECT timestamp_ms, ecg
-            FROM read_parquet('{q(ECG_PARQUET)}')
-            WHERE timestamp_ms >= {start_ms} AND timestamp_ms <= {end_ms}
-            ORDER BY timestamp_ms
-            """
+        table = self.ecg_dataset.to_table(
+            columns=["timestamp_ms", "ecg"],
+            filter=(ds.field("timestamp_ms") >= int(start_ms)) & (ds.field("timestamp_ms") <= int(end_ms)),
         )
-        return [int(r["timestamp_ms"]) for r in rows], [float(r["ecg"]) for r in rows]
+        if table.num_rows == 0:
+            return [], []
+        table = table.take(pc.sort_indices(table, sort_keys=[("timestamp_ms", "ascending")])).combine_chunks()
+        return (
+            [int(v.as_py()) for v in table.column("timestamp_ms")],
+            [float(v.as_py()) for v in table.column("ecg")],
+        )
 
     def _load_ecg_by_segment(self, segment_idx: int) -> tuple[list[int], list[float]]:
-        if not ECG_PARQUET.exists():
+        if self.ecg_dataset is None:
             return [], []
-        rows = duck_json(
-            f"""
-            SELECT timestamp_ms, ecg
-            FROM read_parquet('{q(ECG_PARQUET)}')
-            WHERE segment_idx = {segment_idx}
-            ORDER BY timestamp_ms
-            """
+        table = self.ecg_dataset.to_table(
+            columns=["timestamp_ms", "ecg"],
+            filter=ds.field("segment_idx") == int(segment_idx),
         )
-        return [int(r["timestamp_ms"]) for r in rows], [float(r["ecg"]) for r in rows]
+        if table.num_rows == 0:
+            return [], []
+        table = table.take(pc.sort_indices(table, sort_keys=[("timestamp_ms", "ascending")])).combine_chunks()
+        return (
+            [int(v.as_py()) for v in table.column("timestamp_ms")],
+            [float(v.as_py()) for v in table.column("ecg")],
+        )
 
     def _load_current_peaks(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
-        if not PEAKS_PARQUET.exists():
+        if self.peaks_dataset is None:
             return []
-        return duck_json(
-            f"""
-            SELECT peak_id, timestamp_ms, source, is_added_peak, segment_idx
-            FROM read_parquet('{q(PEAKS_PARQUET)}')
-            WHERE timestamp_ms >= {start_ms} AND timestamp_ms <= {end_ms}
-            ORDER BY timestamp_ms
-            """
+        table = self.peaks_dataset.to_table(
+            columns=["peak_id", "timestamp_ms", "source", "segment_idx"],
+            filter=(ds.field("timestamp_ms") >= int(start_ms)) & (ds.field("timestamp_ms") <= int(end_ms)),
         )
+        if table.num_rows == 0:
+            return []
+        table = table.take(pc.sort_indices(table, sort_keys=[("timestamp_ms", "ascending")])).combine_chunks()
+        rows = table.to_pylist()
+        for row in rows:
+            row["is_added_peak"] = False
+        return rows
 
     def _load_current_peaks_by_segment(self, segment_idx: int) -> list[dict[str, Any]]:
-        if not PEAKS_PARQUET.exists():
+        if self.peaks_dataset is None:
             return []
-        return duck_json(
-            f"""
-            SELECT peak_id, timestamp_ms, source, is_added_peak, segment_idx
-            FROM read_parquet('{q(PEAKS_PARQUET)}')
-            WHERE segment_idx = {segment_idx}
-            ORDER BY timestamp_ms
-            """
+        table = self.peaks_dataset.to_table(
+            columns=["peak_id", "timestamp_ms", "source", "segment_idx"],
+            filter=ds.field("segment_idx") == int(segment_idx),
         )
+        if table.num_rows == 0:
+            return []
+        table = table.take(pc.sort_indices(table, sort_keys=[("timestamp_ms", "ascending")])).combine_chunks()
+        rows = table.to_pylist()
+        for row in rows:
+            row["is_added_peak"] = False
+        return rows
 
     def _ecg_at(self, timestamp_ms: int) -> float:
         if not self.ecg_ms:
@@ -968,14 +1547,37 @@ class MasterAnnotationViewer:
     def _all_segment_beat_rows(self, seg_idx: int) -> list[dict[str, Any]]:
         return self.beats_by_segment.setdefault(seg_idx, [])
 
+    def _rebuild_added_beat_index(self) -> None:
+        self.added_beats_by_timestamp = [
+            (int(row["timestamp_ms"]), row)
+            for row in self.beats
+            if bool_value(row.get("is_added_peak"))
+        ]
+        self.added_beats_by_timestamp.sort(key=lambda item: item[0])
+
+    def _visible_added_beat_rows(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        if not getattr(self.args, "markers", False) and not getattr(self.args, "marker_recovery", False):
+            return self._all_segment_beat_rows(self._segment_idx())
+        lo = bisect.bisect_left(self.added_beats_by_timestamp, int(start_ms), key=lambda item: item[0])
+        hi = bisect.bisect_right(self.added_beats_by_timestamp, int(end_ms), key=lambda item: item[0])
+        return [row for _, row in self.added_beats_by_timestamp[lo:hi]]
+
     def _make_points(self) -> list[PeakPoint]:
         seg_idx = self._segment_idx()
+        seg = self.current_segment()
+        start_ms = self.view_lo_ms if self.view_lo_ms is not None else int(seg["start_ms"])
+        end_ms = self.view_hi_ms if self.view_hi_ms is not None else int(seg["end_ms"])
         points: list[PeakPoint] = []
         seen_keys: set[tuple[int, str]] = set()
 
         for peak in self.current_peak_rows:
             ts = int(peak["timestamp_ms"])
-            ann = self._annotation_for_timestamp(seg_idx, ts)
+            point_seg_idx = int_or_none(peak.get("segment_idx")) if (
+                getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False)
+            ) else seg_idx
+            if point_seg_idx is None:
+                point_seg_idx = seg_idx
+            ann = self._annotation_for_timestamp(point_seg_idx, ts)
             label = str(ann.get("label")) if ann else "clean"
             subtype = str(ann.get("subtype") or "") if ann else ""
             source = str(peak.get("source") or "called_peak")
@@ -992,10 +1594,11 @@ class MasterAnnotationViewer:
                     label=label,
                     subtype=subtype,
                     raw_timestamp_ms=ts,
+                    segment_idx=point_seg_idx,
                 )
             )
 
-        for ann in self._all_segment_beat_rows(seg_idx):
+        for ann in self._visible_added_beat_rows(start_ms, end_ms):
             if not bool_value(ann.get("is_added_peak")):
                 continue
             ts = int(ann["timestamp_ms"])
@@ -1013,6 +1616,7 @@ class MasterAnnotationViewer:
                     label=str(ann.get("label") or "clean"),
                     subtype=str(ann.get("subtype") or ""),
                     raw_timestamp_ms=ts,
+                    segment_idx=int_or_none(ann.get("segment_idx")),
                 )
             )
 
@@ -1053,11 +1657,35 @@ class MasterAnnotationViewer:
             "beat_rows": copy.deepcopy(self.beats_by_segment.get(target_idx, [])),
         }
 
+    def _beat_segments_snapshot(self, seg_idxs: set[int] | list[int] | tuple[int, ...]) -> dict[str, Any]:
+        target_idxs = sorted({int(seg_idx) for seg_idx in seg_idxs})
+        return {
+            "kind": "beat_segments",
+            "segment_idxs": target_idxs,
+            "beat_rows_by_segment": {
+                int(seg_idx): copy.deepcopy(self.beats_by_segment.get(int(seg_idx), []))
+                for seg_idx in target_idxs
+            },
+        }
+
+    def _bad_segment_snapshot(self, seg_idx: int | None = None) -> dict[str, Any]:
+        target_idx = int(seg_idx if seg_idx is not None else self._segment_idx())
+        return {
+            "kind": "bad_segment",
+            "segment_idx": target_idx,
+            "segment_row": copy.deepcopy(self.segment_by_idx.get(target_idx)),
+            "bad_rows": copy.deepcopy(self.bad_by_segment.get(target_idx, [])),
+        }
+
     def _snapshot_for_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
         if entry.get("kind") == "segment_row":
             return self._segment_row_snapshot(int(entry["segment_idx"]))
         if entry.get("kind") == "beat_segment":
             return self._beat_segment_snapshot(int(entry["segment_idx"]))
+        if entry.get("kind") == "beat_segments":
+            return self._beat_segments_snapshot([int(v) for v in entry.get("segment_idxs", [])])
+        if entry.get("kind") == "bad_segment":
+            return self._bad_segment_snapshot(int(entry["segment_idx"]))
         return self._snapshot()
 
     def _restore(self, state: dict[str, Any]) -> None:
@@ -1088,6 +1716,48 @@ class MasterAnnotationViewer:
                     self.beats_by_segment[target_idx] = restored_rows
                 else:
                     self.beats_by_segment.pop(target_idx, None)
+                self._rebuild_added_beat_index()
+                self._refresh_segment_group(target_idx)
+        elif state.get("kind") == "beat_segments":
+            target_idxs = {int(v) for v in state.get("segment_idxs", [])}
+            rows_by_segment = {
+                int(k): copy.deepcopy(v)
+                for k, v in (state.get("beat_rows_by_segment") or {}).items()
+            }
+            if target_idxs:
+                self.beats = [r for r in self.beats if int(r["segment_idx"]) not in target_idxs]
+                for seg_idx in sorted(target_idxs):
+                    restored_rows = rows_by_segment.get(seg_idx, [])
+                    self.beats.extend(restored_rows)
+                    if restored_rows:
+                        self.beats_by_segment[seg_idx] = restored_rows
+                    else:
+                        self.beats_by_segment.pop(seg_idx, None)
+                    self._refresh_segment_group(seg_idx)
+                self._rebuild_added_beat_index()
+        elif state.get("kind") == "bad_segment":
+            if target_idx is not None:
+                restored_segment = copy.deepcopy(state.get("segment_row"))
+                restored_bad = copy.deepcopy(state.get("bad_rows") or [])
+                if restored_segment is None:
+                    self.segments = [r for r in self.segments if int(r["segment_idx"]) != target_idx]
+                    self.segment_by_idx.pop(target_idx, None)
+                else:
+                    replaced = False
+                    for idx, existing in enumerate(self.segments):
+                        if int(existing["segment_idx"]) == target_idx:
+                            self.segments[idx] = restored_segment
+                            replaced = True
+                            break
+                    if not replaced:
+                        self.segments.append(restored_segment)
+                    self.segment_by_idx[target_idx] = restored_segment
+                self.bad_regions = [r for r in self.bad_regions if int(r["segment_idx"]) != target_idx]
+                self.bad_regions.extend(restored_bad)
+                if restored_bad:
+                    self.bad_by_segment[target_idx] = restored_bad
+                else:
+                    self.bad_by_segment.pop(target_idx, None)
                 self._refresh_segment_group(target_idx)
         else:
             self.segments = copy.deepcopy(state["segments"])
@@ -1097,11 +1767,17 @@ class MasterAnnotationViewer:
             self.beats_by_segment = {}
             for row in self.beats:
                 self.beats_by_segment.setdefault(int(row["segment_idx"]), []).append(row)
+            self._rebuild_added_beat_index()
             self.bad_by_segment = {}
             for row in self.bad_regions:
                 self.bad_by_segment.setdefault(int(row["segment_idx"]), []).append(row)
             self.segment_group_by_idx = {}
             self._refresh_all_segment_groups()
+        if getattr(self.args, "physio_review", False):
+            if self.physio_review_total > 0:
+                self.index = max(0, min(self.physio_review_total - 1, int(self.index)))
+                self.visible_segments = [self._physio_review_row_at(self.index)]
+            return
         selected = self._select_segments()
         if target_idx is not None:
             target = self.segment_by_idx.get(target_idx)
@@ -1133,8 +1809,20 @@ class MasterAnnotationViewer:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
 
-    def _push_beat_undo(self) -> None:
-        self.undo_stack.append(self._beat_segment_snapshot())
+    def _push_beat_undo(self, seg_idx: int | None = None) -> None:
+        self.undo_stack.append(self._beat_segment_snapshot(seg_idx))
+        if len(self.undo_stack) > 100:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def _push_beat_multi_undo(self, seg_idxs: set[int] | list[int] | tuple[int, ...]) -> None:
+        self.undo_stack.append(self._beat_segments_snapshot(seg_idxs))
+        if len(self.undo_stack) > 100:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def _push_bad_undo(self, seg_idx: int | None = None) -> None:
+        self.undo_stack.append(self._bad_segment_snapshot(seg_idx))
         if len(self.undo_stack) > 100:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
@@ -1153,6 +1841,13 @@ class MasterAnnotationViewer:
 
     def _save_beats_output(self) -> None:
         write_parquet(OUT_BEATS, self.beats, BEAT_COLUMNS, "beats")
+
+    def _save_bad_output(self) -> None:
+        write_parquet(OUT_BAD, self.bad_regions, BAD_COLUMNS, "bad")
+
+    def _save_segment_and_bad_outputs(self) -> None:
+        self._save_segment_outputs()
+        self._save_bad_output()
 
     def _after_change(self, status: str, save: bool = True) -> None:
         self.status = status
@@ -1190,7 +1885,48 @@ class MasterAnnotationViewer:
         logger.log(action, segment_idx=segment_idx, details=details or {})
 
     def _go(self, delta: int) -> None:
+        self._go_physio_or_segment(delta, skip_reviewed=False)
+
+    def _go_physio_or_segment(self, delta: int, skip_reviewed: bool = False) -> None:
         if not self.visible_segments:
+            return
+        if getattr(self.args, "markers", False):
+            marker_idx = int(self.current_segment().get("_marker_idx") or 0)
+            indices = self.marker_groups.get(marker_idx, [])
+            if not indices:
+                return
+            pos = indices.index(self.index) if self.index in indices else min(
+                range(len(indices)),
+                key=lambda i: abs((int_or_none(self.visible_segments[indices[i]].get("_marker_offset")) or 0)),
+            )
+            new_pos = pos + (1 if delta >= 0 else -1)
+            if new_pos < 0 or new_pos >= len(indices):
+                side = "left" if delta < 0 else "right"
+                self.status = f"Marker {marker_idx}: {side} edge"
+                self._draw()
+                return
+            self.index = indices[new_pos]
+            self.mode = "browse"
+            self.bad_region_start_ms = None
+            self.physio_region_start_ms = None
+            self._load_window(reset_view=True)
+            self._skip_empty_windows(direction=delta)
+            self._draw()
+            return
+        if getattr(self.args, "physio_review", False):
+            next_index = self._find_physio_review_index(self.index + delta, delta, skip_reviewed=skip_reviewed)
+            if next_index is None:
+                self.status = "No remaining unreviewed physio review beats" if skip_reviewed else "End of physio review queue"
+                self._draw()
+                return
+            self.index = next_index
+            self.visible_segments = [self._physio_review_row_at(self.index)]
+            self.mode = "browse"
+            self.bad_region_start_ms = None
+            self.physio_region_start_ms = None
+            self._load_window(reset_view=True)
+            self._skip_empty_windows(direction=delta)
+            self._draw()
             return
         if delta > 0 and self.forward_stack:
             target_idx = self.forward_stack.pop()
@@ -1206,6 +1942,7 @@ class MasterAnnotationViewer:
                     self.index = 0
                 self.mode = "browse"
                 self.bad_region_start_ms = None
+                self.physio_region_start_ms = None
                 self._load_window(reset_view=True)
                 self._skip_empty_windows(direction=1)
                 self._log_action("navigate_forward_to_return_segment", {"from_key": "right"}, segment_idx=target_idx)
@@ -1223,6 +1960,7 @@ class MasterAnnotationViewer:
                 self.index = 0
                 self.mode = "browse"
                 self.bad_region_start_ms = None
+                self.physio_region_start_ms = None
                 self._load_window(reset_view=True)
                 self._skip_empty_windows(direction=-1)
                 self._log_action("navigate_back_to_recent_segment", {"from_key": "left"}, segment_idx=target_idx)
@@ -1246,8 +1984,27 @@ class MasterAnnotationViewer:
             self.index = max(0, bisect.bisect_left(starts, current_start) - 1)
         self.mode = "browse"
         self.bad_region_start_ms = None
+        self.physio_region_start_ms = None
         self._load_window(reset_view=True)
         self._skip_empty_windows(direction=delta)
+        self._draw()
+
+    def _advance_to_next_marker_center(self) -> None:
+        if not getattr(self.args, "markers", False):
+            self._advance_after_terminal_label()
+            return
+        next_pos = self._find_next_marker_position(self.marker_position + 1, 1)
+        if next_pos is None:
+            self.status = "No remaining unreviewed marker-center segments"
+            self._draw()
+            return
+        self.marker_position = next_pos
+        self.index = self._marker_center_index(self.marker_order[self.marker_position])
+        self.mode = "browse"
+        self.bad_region_start_ms = None
+        self.physio_region_start_ms = None
+        self._load_window(reset_view=True)
+        self._skip_empty_windows(direction=1)
         self._draw()
 
     def _advance_after_terminal_label(self) -> None:
@@ -1288,13 +2045,36 @@ class MasterAnnotationViewer:
             row["beat_training_eligible_segment"] = True
             row["segment_quality_training_eligible"] = True
 
+    def _persistent_current_segment(self) -> dict[str, Any]:
+        seg = self.current_segment()
+        seg_idx = int(seg["segment_idx"])
+        row = self.segment_by_idx.get(seg_idx)
+        if row is None:
+            row = {col: seg.get(col) for col in SEGMENT_COLUMNS}
+            self.segments.append(row)
+            self.segment_by_idx[seg_idx] = row
+        return row
+
+    def _sync_current_marker_row(self, row: dict[str, Any]) -> None:
+        if not (getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False)) or not self.visible_segments:
+            return
+        marker_fields = {
+            key: self.visible_segments[self.index].get(key)
+            for key in ("_marker_idx", "_marker_timestamp_ms", "_marker_center_segment_idx", "_marker_offset")
+        }
+        self.visible_segments[self.index].update({col: row.get(col) for col in SEGMENT_COLUMNS})
+        self.visible_segments[self.index].update(marker_fields)
+
     def _toggle_reviewed(self) -> None:
         self._push_segment_undo()
-        seg = self.current_segment()
+        seg = self._persistent_current_segment() if (
+            getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False)
+        ) else self.current_segment()
         self.forward_stack.clear()
         if str(seg.get("review_status")) == "reviewed":
             before = dict(seg)
             seg["review_status"] = "unreviewed"
+            self._sync_current_marker_row(seg)
             self._log_action(
                 "segment_unmarked_reviewed",
                 {"before": before, "after": dict(seg)},
@@ -1309,6 +2089,7 @@ class MasterAnnotationViewer:
         if str(seg.get("segment_quality_label") or "unknown") == "unknown":
             seg["segment_quality_label"] = "partial" if bool_value(seg.get("has_bad_region")) else "usable"
         self._set_segment_quality_fields(seg)
+        self._sync_current_marker_row(seg)
         self._log_action(
             "segment_marked_reviewed",
             {"before": before, "after": dict(seg)},
@@ -1316,16 +2097,19 @@ class MasterAnnotationViewer:
         )
         self._save_segment_outputs()
         self.status = f"Marked Segment {seg['segment_idx']} reviewed"
-        self._advance_after_terminal_label()
+        self._advance_to_next_marker_center() if getattr(self.args, "markers", False) else self._advance_after_terminal_label()
 
     def _toggle_revisit(self) -> None:
         self._push_segment_undo()
-        seg = self.current_segment()
+        seg = self._persistent_current_segment() if (
+            getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False)
+        ) else self.current_segment()
         self.forward_stack.clear()
         if bool_value(seg.get("in_revisit_pile")) or str(seg.get("review_status")) == "revisit":
             before = dict(seg)
             seg["in_revisit_pile"] = False
             seg["review_status"] = "unreviewed"
+            self._sync_current_marker_row(seg)
             self._log_action(
                 "segment_removed_from_revisit",
                 {"before": before, "after": dict(seg)},
@@ -1337,6 +2121,7 @@ class MasterAnnotationViewer:
         self.back_stack.append(int(seg["segment_idx"]))
         seg["in_revisit_pile"] = True
         seg["review_status"] = "revisit"
+        self._sync_current_marker_row(seg)
         self._log_action(
             "segment_added_to_revisit",
             {"before": before, "after": dict(seg)},
@@ -1344,11 +2129,11 @@ class MasterAnnotationViewer:
         )
         self._save_segment_outputs()
         self.status = f"Added Segment {seg['segment_idx']} to revisit"
-        self._advance_after_terminal_label()
+        self._advance_to_next_marker_center() if getattr(self.args, "markers", False) else self._advance_after_terminal_label()
 
     def _toggle_unusable(self) -> None:
         self._push_segment_undo()
-        seg = self.current_segment()
+        seg = self._persistent_current_segment() if getattr(self.args, "marker_recovery", False) else self.current_segment()
         self.forward_stack.clear()
         old = str(seg.get("segment_quality_label") or "unknown")
         old_beat = bool_value(seg.get("beat_training_eligible_segment"))
@@ -1368,14 +2153,22 @@ class MasterAnnotationViewer:
         else:
             self.back_stack.append(int(seg["segment_idx"]))
             seg["segment_quality_label"] = "unusable"
+            seg["review_status"] = "reviewed"
+            seg["in_revisit_pile"] = False
             seg["beat_training_eligible_segment"] = False
             seg["segment_quality_training_eligible"] = True
+            self._sync_current_marker_row(seg)
             self._log_action(
                 "segment_marked_unusable",
                 {"before": before, "after": dict(seg)},
                 segment_idx=int(seg["segment_idx"]),
             )
-            self._after_segment_change(f"Marked Segment {seg['segment_idx']} unusable")
+            if getattr(self.args, "marker_recovery", False):
+                self._save_segment_outputs()
+                self.status = f"Marked Segment {seg['segment_idx']} reviewed unusable"
+                self._advance_after_terminal_label()
+            else:
+                self._after_segment_change(f"Marked Segment {seg['segment_idx']} unusable")
 
     def _restore_last_b_toggle(self) -> None:
         if not self.last_b_revert:
@@ -1396,9 +2189,11 @@ class MasterAnnotationViewer:
         )
 
     def _add_bad_region(self, start_ms: int, end_ms: int) -> None:
-        self._push_undo()
-        seg = self.current_segment()
+        seg = self._persistent_current_segment() if (
+            getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False)
+        ) else self.current_segment()
         seg_idx = int(seg["segment_idx"])
+        self._push_bad_undo(seg_idx)
         lo = min(start_ms, end_ms)
         hi = max(start_ms, end_ms)
         existing = self.bad_by_segment.setdefault(seg_idx, [])
@@ -1418,11 +2213,14 @@ class MasterAnnotationViewer:
         if str(seg.get("segment_quality_label") or "unknown") in {"unknown", "usable", ""}:
             seg["segment_quality_label"] = "partial"
         self._set_segment_quality_fields(seg)
+        self._sync_current_marker_row(seg)
         self.mode = "browse"
         self.bad_region_start_ms = None
         self._refresh_segment_group(seg_idx)
         self._log_action("bad_region_added", {"region": dict(row), "segment_after": dict(seg)}, segment_idx=seg_idx)
-        self._after_change(f"Added bad region to Segment {seg_idx}")
+        self.status = f"Added bad region to Segment {seg_idx}"
+        self._save_segment_and_bad_outputs()
+        self._draw()
 
     def _find_hit(self, event: Any) -> PeakPoint | None:
         if event.x is None or event.y is None:
@@ -1442,7 +2240,7 @@ class MasterAnnotationViewer:
         return int(point.raw_timestamp_ms if point.raw_timestamp_ms is not None else point.timestamp_ms)
 
     def _upsert_beat_label(self, point: PeakPoint, label: str, subtype: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-        seg_idx = self._segment_idx()
+        seg_idx = self._point_segment_idx(point)
         identity_ts = self._point_identity_ts(point)
         row = self._annotation_for_timestamp(seg_idx, identity_ts)
         before = copy.deepcopy(row) if row is not None else None
@@ -1466,10 +2264,9 @@ class MasterAnnotationViewer:
         return before, copy.deepcopy(row)
 
     def _remove_annotation_for_point(self, point: PeakPoint) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-        seg_idx = self._segment_idx()
+        seg_idx = self._point_segment_idx(point)
         identity_ts = self._point_identity_ts(point)
         rows = self.beats_by_segment.get(seg_idx, [])
-        changed = False
         changes: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for row in rows:
             if abs(int(row["timestamp_ms"]) - identity_ts) <= ANNOTATION_MATCH_TOLERANCE_MS:
@@ -1478,18 +2275,13 @@ class MasterAnnotationViewer:
                 row["subtype"] = "added" if bool_value(row.get("is_added_peak")) else "auto"
                 row["beat_training_eligible"] = True
                 changes.append((before, copy.deepcopy(row)))
-                changed = True
-        if changed:
-            for row in self.beats:
-                if int(row["segment_idx"]) == seg_idx and abs(int(row["timestamp_ms"]) - identity_ts) <= ANNOTATION_MATCH_TOLERANCE_MS:
-                    row["label"] = "clean"
-                    row["subtype"] = "added" if bool_value(row.get("is_added_peak")) else "auto"
-                    row["beat_training_eligible"] = True
+        # rows is built from self.beats, so the dict updates above already
+        # mutate the canonical table.
         return changes
 
     def _toggle_artifact(self, point: PeakPoint) -> None:
-        self._push_beat_undo()
-        seg_idx = self._segment_idx()
+        seg_idx = self._point_segment_idx(point)
+        self._push_beat_undo(seg_idx)
         if point.label == "artifact" and point.subtype == "interpolate":
             changes = self._remove_annotation_for_point(point)
             self._refresh_segment_group(seg_idx)
@@ -1519,8 +2311,8 @@ class MasterAnnotationViewer:
             self._after_beat_change(f"Marked artifact at {point.timestamp_ms}")
 
     def _toggle_physio(self, point: PeakPoint) -> None:
-        self._push_beat_undo()
-        seg_idx = self._segment_idx()
+        seg_idx = self._point_segment_idx(point)
+        self._push_beat_undo(seg_idx)
         if point.label == "physio":
             changes = self._remove_annotation_for_point(point)
             self._refresh_segment_group(seg_idx)
@@ -1536,18 +2328,92 @@ class MasterAnnotationViewer:
             )
             self._after_beat_change(f"Marked physio at {point.timestamp_ms}")
 
+    def _review_metadata(self) -> dict[str, Any]:
+        seg = self.current_segment()
+        return {
+            "review_peak_id": int_or_none(seg.get("_review_peak_id")),
+            "review_peak_timestamp_ms": int_or_none(seg.get("_review_peak_timestamp_ms")),
+            "review_assigned_label": str(seg.get("_review_assigned_label") or ""),
+        }
+
+    def _toggle_physio_review_label(self, point: PeakPoint, label: str, subtype: str, display: str) -> None:
+        seg_idx = self._point_segment_idx(point)
+        self._push_beat_undo(seg_idx)
+        before, after = self._upsert_beat_label(point, label, subtype)
+        action = f"physio_review_{label}_marked"
+        self._log_action(
+            action,
+            {"point": point.__dict__, "before": before, "after": after},
+            segment_idx=seg_idx,
+        )
+        self._after_beat_change(f"Marked {display} at {point.timestamp_ms}")
+
+    def _mark_physio_segment_reviewed(self) -> None:
+        seg = self.current_segment()
+        seg_idx = int(seg["segment_idx"])
+        self._push_segment_undo()
+        before = copy.deepcopy(self.segment_by_idx.get(seg_idx))
+        row = self.segment_by_idx.get(seg_idx)
+        if row is None:
+            row = {
+                "segment_idx": seg_idx,
+                "start_ms": int(seg["start_ms"]),
+                "end_ms": int(seg["end_ms"]),
+                "review_status": "reviewed",
+                "segment_quality_label": str(seg.get("segment_quality_label") or "usable"),
+                "in_revisit_pile": False,
+                "has_bad_region": False,
+                "bad_region_count": 0,
+                "beat_training_eligible_segment": True,
+                "segment_quality_training_eligible": True,
+                "comment": "",
+            }
+            self.segments.append(row)
+            self.segment_by_idx[seg_idx] = row
+        else:
+            row["start_ms"] = int(seg["start_ms"])
+            row["end_ms"] = int(seg["end_ms"])
+            row["review_status"] = "reviewed"
+            if str(row.get("segment_quality_label") or "").strip() in {"", "unknown"}:
+                row["segment_quality_label"] = "usable"
+            row["in_revisit_pile"] = False
+        self._set_segment_quality_fields(row)
+        self._log_action(
+            "physio_segment_marked_reviewed",
+            {"before": before, "after": copy.deepcopy(row)},
+            segment_idx=seg_idx,
+        )
+        self.physio_reviewed_segment_idxs.add(seg_idx)
+        self._refresh_segment_group(seg_idx)
+        self._save_segment_outputs()
+        self.status = f"Marked physio Segment {seg_idx} reviewed"
+        self._go_physio_or_segment(1, skip_reviewed=True)
+
+    def _add_physio_region(self, start_ms: int, end_ms: int) -> None:
+        _ = (start_ms, end_ms)
+        self.mode = "browse"
+        self.physio_region_start_ms = None
+        self.status = "Physio regions are not saved until a single non-bad-region schema exists"
+        self._log_action("physio_region_not_saved", {"reason": "no unified region schema"})
+        self._draw()
+
     def _add_peak_at_click(self, event: Any) -> None:
         if event.xdata is None:
             return
-        self._push_beat_undo()
         seg = self.current_segment()
         ts = int(int(seg["start_ms"]) + round(float(event.xdata) * 1000))
-        ts = max(int(seg["start_ms"]), min(int(seg["end_ms"]), ts))
+        lo = self.loaded_lo_ms if self.loaded_lo_ms is not None else int(seg["start_ms"])
+        hi = self.loaded_hi_ms if self.loaded_hi_ms is not None else int(seg["end_ms"])
+        ts = max(int(lo), min(int(hi), ts))
         snap_window = PRECISE_ADDED_PEAK_SNAP_WINDOW_MS if self.precise_add_mode else ADDED_PEAK_SNAP_WINDOW_MS
         ts, _ = self._local_max_point(ts, window_ms=snap_window)
+        seg_idx = self._real_segment_idx_for_timestamp(ts) if (
+            getattr(self.args, "markers", False) or getattr(self.args, "marker_recovery", False)
+        ) else int(seg["segment_idx"])
+        self._push_beat_undo(seg_idx)
         row = {
             "timestamp_ms": ts,
-            "segment_idx": int(seg["segment_idx"]),
+            "segment_idx": seg_idx,
             "label": "clean",
             "subtype": "added",
             "is_added_peak": True,
@@ -1555,9 +2421,11 @@ class MasterAnnotationViewer:
             "comment": "",
         }
         self.beats.append(row)
-        self.beats_by_segment.setdefault(int(seg["segment_idx"]), []).append(row)
-        self._refresh_segment_group(int(seg["segment_idx"]))
-        self._log_action("added_peak_created", {"row": dict(row)}, segment_idx=int(seg["segment_idx"]))
+        self.beats_by_segment.setdefault(seg_idx, []).append(row)
+        self.added_beats_by_timestamp.append((ts, row))
+        self.added_beats_by_timestamp.sort(key=lambda item: item[0])
+        self._refresh_segment_group(seg_idx)
+        self._log_action("added_peak_created", {"row": dict(row)}, segment_idx=seg_idx)
         self._after_beat_change(f"Added peak at {ts}")
 
     def _auto_negative_artifacts(self) -> None:
@@ -1574,7 +2442,8 @@ class MasterAnnotationViewer:
             self.status = "No peaks met the <25% neighbors or <50% segment-average amplitude rules"
             self._draw()
             return
-        self._push_beat_undo()
+        seg_idxs = {self._point_segment_idx(point) for point in candidates}
+        self._push_beat_multi_undo(seg_idxs)
         count = 0
         changes: list[dict[str, Any]] = []
         for point in candidates:
@@ -1594,6 +2463,19 @@ class MasterAnnotationViewer:
             return
         if self.comment_active:
             return
+        if self.mode == "physio_region":
+            if event.xdata is None:
+                return
+            seg = self.current_segment()
+            ts = int(int(seg["start_ms"]) + round(float(event.xdata) * 1000))
+            ts = max(int(seg["start_ms"]), min(int(seg["end_ms"]), ts))
+            if self.physio_region_start_ms is None:
+                self.physio_region_start_ms = ts
+                self.status = f"Physio region start {ts}"
+                self._draw()
+            else:
+                self._add_physio_region(self.physio_region_start_ms, ts)
+            return
         if self.mode == "bad_region":
             if event.xdata is None:
                 return
@@ -1609,9 +2491,24 @@ class MasterAnnotationViewer:
             return
 
         point = self._find_hit(event)
+        if self.mode == "pac_pvc":
+            if point is not None:
+                self._toggle_physio_review_label(point, "pac_pvc", "manual", "PAC/PVC")
+            return
+        if self.mode == "physio_aftereffect":
+            if point is not None:
+                self._toggle_physio_review_label(point, "physio_aftereffect", "manual", "physio aftereffect")
+            return
+        if self.mode == "arrhythmia_unspecified":
+            if point is not None:
+                self._toggle_physio_review_label(point, "arrhythmia_unspecified", "manual", "unspecified arrhythmia")
+            return
         if self.mode == "physio":
             if point is not None:
-                self._toggle_physio(point)
+                if getattr(self.args, "physio_review", False):
+                    self._toggle_physio_review_label(point, "physio", "manual", "physio beat")
+                else:
+                    self._toggle_physio(point)
             return
         if point is not None:
             self._toggle_artifact(point)
@@ -1623,41 +2520,49 @@ class MasterAnnotationViewer:
             return
         seg = self.current_segment()
         seg_start = int(seg["start_ms"])
-        seg_end = int(seg["end_ms"])
-        lo = self.view_lo_ms if self.view_lo_ms is not None else seg_start
-        hi = self.view_hi_ms if self.view_hi_ms is not None else seg_end
+        bound_lo = self.loaded_lo_ms if self.loaded_lo_ms is not None else int(seg["start_ms"])
+        bound_hi = self.loaded_hi_ms if self.loaded_hi_ms is not None else int(seg["end_ms"])
+        lo = self.view_lo_ms if self.view_lo_ms is not None else bound_lo
+        hi = self.view_hi_ms if self.view_hi_ms is not None else bound_hi
         center = seg_start + int(float(event.xdata) * 1000)
         current_width = hi - lo
         if event.button == "up":
             width = max(MIN_VIEW_MS, int(current_width / ZOOM_FACTOR))
         else:
-            width = min(MAX_VIEW_MS, int(current_width * ZOOM_FACTOR))
+            width = min(max(MAX_VIEW_MS, bound_hi - bound_lo), int(current_width * ZOOM_FACTOR))
         cursor_frac = 0.5 if current_width <= 0 else (center - lo) / current_width
         cursor_frac = max(0.05, min(0.95, cursor_frac))
         new_lo = int(center - width * cursor_frac)
         new_hi = new_lo + width
-        if new_lo < seg_start:
-            shift = seg_start - new_lo
+        if new_lo < bound_lo:
+            shift = bound_lo - new_lo
             new_lo += shift
             new_hi += shift
-        if new_hi > seg_end:
-            shift = new_hi - seg_end
+        if new_hi > bound_hi:
+            shift = new_hi - bound_hi
             new_lo -= shift
             new_hi -= shift
-        new_lo = max(seg_start, new_lo)
-        new_hi = min(seg_end, new_hi)
+        new_lo = max(bound_lo, new_lo)
+        new_hi = min(bound_hi, new_hi)
         self.view_lo_ms, self.view_hi_ms = new_lo, new_hi
         self._draw()
 
     def on_key(self, event: Any) -> None:
         key = event.key or ""
+        if key in {" ", "spacebar"}:
+            key = "space"
         if self.comment_active:
             self._handle_comment_key(key)
             return
         if key in {"left", "["}:
             self._go(-1)
-        elif key in {"right", "]", "space"}:
+        elif key in {"right", "]"}:
             self._go(1)
+        elif key == "space":
+            if getattr(self.args, "physio_review", False):
+                self._mark_physio_segment_reviewed()
+            else:
+                self._toggle_reviewed()
         elif key == "z":
             if self.undo_stack:
                 entry = self.undo_stack.pop()
@@ -1665,8 +2570,10 @@ class MasterAnnotationViewer:
                 self._restore(entry)
                 if entry.get("kind") == "segment_row":
                     self._save_segment_outputs()
-                elif entry.get("kind") == "beat_segment":
+                elif entry.get("kind") in {"beat_segment", "beat_segments"}:
                     self._save_beats_output()
+                elif entry.get("kind") == "bad_segment":
+                    self._save_segment_and_bad_outputs()
                 else:
                     self._save_all()
                 self.status = "Undo"
@@ -1680,8 +2587,10 @@ class MasterAnnotationViewer:
                 self._restore(entry)
                 if entry.get("kind") == "segment_row":
                     self._save_segment_outputs()
-                elif entry.get("kind") == "beat_segment":
+                elif entry.get("kind") in {"beat_segment", "beat_segments"}:
                     self._save_beats_output()
+                elif entry.get("kind") == "bad_segment":
+                    self._save_segment_and_bad_outputs()
                 else:
                     self._save_all()
                 self.status = "Redo"
@@ -1689,12 +2598,32 @@ class MasterAnnotationViewer:
                 self._log_action("redo", {"restored_kind": entry.get("kind")}, segment_idx=int_or_none(entry.get("segment_idx")))
                 self._draw()
         elif key == "m":
-            self._toggle_reviewed()
+            self.status = "reviewed is now spacebar"
+            self._draw()
         elif key == "r":
             self._toggle_revisit()
+        elif key == "e":
+            self.mode = "browse" if self.mode == "pac_pvc" else "pac_pvc"
+            self.status = "PAC/PVC mode: click peak(s)"
+            self._draw()
+        elif key == "j":
+            self.mode = "browse" if self.mode == "physio_aftereffect" else "physio_aftereffect"
+            self.status = "Physio aftereffect mode: click peak(s)"
+            self._draw()
+        elif key == "y":
+            self.mode = "browse" if self.mode == "arrhythmia_unspecified" else "arrhythmia_unspecified"
+            self.status = "Unspecified arrhythmia mode: click peak(s)"
+            self._draw()
         elif key == "p":
-            self.mode = "browse" if self.mode == "physio" else "physio"
-            self.status = f"{self.mode} mode"
+            now = time.monotonic()
+            if now - self.last_p_time <= 0.45:
+                self.mode = "physio_region"
+                self.physio_region_start_ms = None
+                self.status = "Physio region mode: click start, then end"
+            else:
+                self.mode = "browse" if self.mode == "physio" else "physio"
+                self.status = "Physio beat mode: click peak(s)"
+            self.last_p_time = now
             self._draw()
         elif key == "b":
             now = time.monotonic()
@@ -1722,6 +2651,7 @@ class MasterAnnotationViewer:
         elif key == "escape":
             self.mode = "browse"
             self.bad_region_start_ms = None
+            self.physio_region_start_ms = None
             self.status = "browse mode"
             self._draw()
         elif key == "q":
@@ -1770,13 +2700,21 @@ class MasterAnnotationViewer:
         y_positions = (0.975, 0.925)
         trans = self.ax.get_xaxis_transform()
         visible_idx = 0
+        intervals: list[tuple[PeakPoint, PeakPoint, int, int]] = []
         for left, right in zip(rr_points, rr_points[1:]):
             rr = right.timestamp_ms - left.timestamp_ms
-            mid_x = ((left.timestamp_ms + right.timestamp_ms) / 2 - seg_start) / 1000.0
             mid_ms = int((left.timestamp_ms + right.timestamp_ms) / 2)
             if mid_ms < lo_ms or mid_ms > hi_ms:
                 prev_rr = rr
                 continue
+            intervals.append((left, right, rr, mid_ms))
+            prev_rr = rr
+        if len(intervals) > MAX_RR_TEXT_LABELS:
+            stride = math.ceil(len(intervals) / MAX_RR_TEXT_LABELS)
+            intervals = intervals[::stride]
+        prev_rr = None
+        for left, right, rr, mid_ms in intervals:
+            mid_x = (mid_ms - seg_start) / 1000.0
             color = self._rr_text_color(prev_rr, rr)
             self.ax.text(
                 mid_x,
@@ -1807,6 +2745,11 @@ class MasterAnnotationViewer:
             self.ax.add_patch(patch)
 
     def _segment_metric_summary(self, seg_idx: int) -> str:
+        if getattr(self.args, "markers", False):
+            marker_ts = int_or_none(self.current_segment().get("_marker_timestamp_ms"))
+            if marker_ts is not None:
+                return f"marker {ms_to_local(marker_ts)}"
+            return "marker"
         metrics = self.segment_metrics.get(seg_idx)
         group = self.segment_group_by_idx.get(seg_idx, "likely-clean")
         if metrics is None:
@@ -1844,6 +2787,16 @@ class MasterAnnotationViewer:
 
         x = [(ms - seg_start) / 1000.0 for ms in self.ecg_ms]
         self.ax.plot(x, self.ecg_y, color=ECG_COLOR, linewidth=1.05, alpha=0.82)
+        review_ts = int_or_none(seg.get("_review_peak_timestamp_ms"))
+        if review_ts is not None:
+            self.ax.axvspan(
+                (review_ts - REVIEW_SHADE_MS - seg_start) / 1000.0,
+                (review_ts + REVIEW_SHADE_MS - seg_start) / 1000.0,
+                color="#fff2a8",
+                alpha=0.16,
+                linewidth=0,
+                zorder=1,
+            )
         if self.ecg_y:
             pad = max((max(self.ecg_y) - min(self.ecg_y)) * 0.15, 0.05)
             self.ax.set_ylim(min(self.ecg_y) - pad, max(self.ecg_y) + pad)
@@ -1859,12 +2812,24 @@ class MasterAnnotationViewer:
         interp_y: list[float] = []
         phys_x: list[float] = []
         phys_y: list[float] = []
+        pac_x: list[float] = []
+        pac_y: list[float] = []
+        after_x: list[float] = []
+        after_y: list[float] = []
+        arr_x: list[float] = []
+        arr_y: list[float] = []
         for p in self.display_points:
             px = (p.timestamp_ms - seg_start) / 1000.0
             if p.label == "artifact" and p.subtype == "interpolate":
                 interp_x.append(px); interp_y.append(p.y)
             elif p.label == "artifact":
                 art_x.append(px); art_y.append(p.y)
+            elif p.label == "pac_pvc":
+                pac_x.append(px); pac_y.append(p.y)
+            elif p.label == "physio_aftereffect":
+                after_x.append(px); after_y.append(p.y)
+            elif p.label == "arrhythmia_unspecified":
+                arr_x.append(px); arr_y.append(p.y)
             elif p.label == "physio":
                 phys_x.append(px); phys_y.append(p.y)
             elif p.is_added_peak:
@@ -1880,6 +2845,12 @@ class MasterAnnotationViewer:
             self.ax.scatter(art_x, art_y, s=190, c=ARTIFACT_COLOR, marker="x", linewidths=3.6, zorder=7)
         if interp_x:
             self.ax.scatter(interp_x, interp_y, s=155, c=ARTIFACT_COLOR, marker="D", edgecolors="#ffd0d8", linewidths=1.5, zorder=7)
+        if pac_x:
+            self.ax.scatter(pac_x, pac_y, s=175, c=PAC_PVC_COLOR, marker="^", edgecolors="#ffe6f6", linewidths=1.2, zorder=8)
+        if after_x:
+            self.ax.scatter(after_x, after_y, s=150, c=PHYSIO_AFTEREFFECT_COLOR, marker="D", edgecolors="#dcfffb", linewidths=1.1, zorder=8)
+        if arr_x:
+            self.ax.scatter(arr_x, arr_y, s=155, c=ARRHYTHMIA_COLOR, marker="s", edgecolors="#fff9be", linewidths=1.1, zorder=8)
         if phys_x:
             self.ax.scatter(phys_x, phys_y, s=210, c=PHYSIO_COLOR, marker="*", edgecolors="#f3e8ff", linewidths=1.3, zorder=8)
 
@@ -1896,22 +2867,51 @@ class MasterAnnotationViewer:
             mode_bits.append("COMMENT MODE")
         elif self.mode != "browse":
             mode_bits.append(self.mode.upper())
-        title = (
-            f"Segment {seg['segment_idx']}  {self.index + 1}/{len(self.visible_segments)}  "
-            f"[{ms_to_local(int(seg['start_ms']))} - {ms_to_local(int(seg['end_ms']))}]"
-        )
+        if getattr(self.args, "markers", False):
+            marker_offset = int_or_none(seg.get("_marker_offset"))
+            marker_offset_text = f"{marker_offset:+d}" if marker_offset is not None else "NA"
+            title = (
+                f"Marker {seg.get('_marker_idx')} seg{marker_offset_text} "
+                f"(Segment {seg['segment_idx']})  {self.marker_position + 1}/{self._queue_size()}  "
+                f"[{ms_to_local(int(seg['start_ms']))} - {ms_to_local(int(seg['end_ms']))}]"
+            )
+        elif getattr(self.args, "marker_recovery", False):
+            marker_offset = int_or_none(seg.get("_marker_offset"))
+            marker_offset_text = f"{marker_offset:+d}" if marker_offset is not None else "NA"
+            title = (
+                f"Marker Recovery {self.index + 1}/{self._queue_size()}  "
+                f"Marker {seg.get('_marker_idx')} seg{marker_offset_text} "
+                f"(Segment {seg['segment_idx']})  "
+                f"[{ms_to_local(int(seg['start_ms']))} - {ms_to_local(int(seg['end_ms']))}]"
+            )
+        else:
+            title = (
+                f"Segment {seg['segment_idx']}  {self.index + 1}/{self._queue_size()}  "
+                f"[{ms_to_local(int(seg['start_ms']))} - {ms_to_local(int(seg['end_ms']))}]"
+            )
         status = self.status
         if self.comment_active:
             status = f"comment: {self.comment_buffer[-120:]}"
         subtitle = (
-            f"{' | '.join(mode_bits) if mode_bits else str(seg.get('review_status'))} | "
+            f"{' | '.join(mode_bits) if mode_bits else self._display_review_status(seg)} | "
             f"{str(seg.get('segment_quality_label'))} | "
             f"{self._segment_metric_summary(int(seg['segment_idx']))} | "
             f"add snap {'1ms' if self.precise_add_mode else f'{ADDED_PEAK_SNAP_WINDOW_MS}ms'} | {status}"
         )
+        if review_ts is not None:
+            review_bits = (
+                f"review peak {seg.get('_review_peak_id')} | "
+                f"{seg.get('_review_assigned_label') or ''}"
+            )
+            subtitle = f"{review_bits} | {subtitle}"
+        if getattr(self.args, "marker_recovery", False):
+            direct_actions = str(seg.get("_direct_actions") or "")
+            if direct_actions:
+                subtitle = f"actions {direct_actions} | {subtitle}"
         keys = (
-            "left/right prev/next | z undo x redo | m reviewed | "
-            "p physio | a precise add | b bad, bb bad region | v negative artifacts | c comment | q quit"
+            "left/right prev/next | z undo x redo | space reviewed | "
+            "p physio, pp physio region | e PAC/PVC | j aftereffect | y arrhythmia | "
+            "a add | b bad, bb bad region | v neg artifacts | c comment | q quit"
         )
         self.ax.set_title(f"{title}\n{subtitle}\n{keys}", color="#e9eef8", fontsize=14, pad=18)
         self.fig.subplots_adjust(left=0.055, right=0.99, bottom=0.08, top=0.84)
@@ -1926,123 +2926,41 @@ class MasterAnnotationViewer:
                 logger.close()
 
 
-def build_headless_viewer(args: argparse.Namespace) -> MasterAnnotationViewer:
-    ensure_inputs()
-    viewer = MasterAnnotationViewer.__new__(MasterAnnotationViewer)
-    viewer.args = args
-    viewer.segments = normalize_rows(load_parquet(OUT_SEGMENTS), SEGMENT_COLUMNS)
-    viewer.beats = normalize_rows(load_parquet(OUT_BEATS), BEAT_COLUMNS)
-    viewer.bad_regions = normalize_rows(load_parquet(OUT_BAD), BAD_COLUMNS)
-    viewer.segment_by_idx = {int(r["segment_idx"]): r for r in viewer.segments}
-    viewer.beats_by_segment = {}
-    for row in viewer.beats:
-        viewer.beats_by_segment.setdefault(int(row["segment_idx"]), []).append(row)
-    viewer.bad_by_segment = {}
-    for row in viewer.bad_regions:
-        viewer.bad_by_segment.setdefault(int(row["segment_idx"]), []).append(row)
-    viewer.segment_metrics = viewer._load_segment_metrics()
-    viewer.segment_group_by_idx = {}
-    viewer._refresh_all_segment_groups()
-    viewer.visible_segments = []
-    viewer.index = 0
-    viewer.view_lo_ms = None
-    viewer.view_hi_ms = None
-    viewer.ecg_ms = []
-    viewer.ecg_y = []
-    viewer.current_peak_rows = []
-    viewer.display_points = []
-    viewer.window_cache = {}
-    viewer.window_cache_order = []
-    viewer.status = ""
-    viewer.action_logger = ActionLogger(
-        ACTION_LOG,
-        {
-            "script": str(Path(__file__)),
-            "mode": "auto_apply_v_to_likely",
-            "log_path": str(ACTION_LOG),
-        },
-    )
-    return viewer
-
-
-def auto_apply_v_to_likely(args: argparse.Namespace) -> None:
-    viewer = build_headless_viewer(args)
-    total_candidates = 0
-    changed_segments = 0
-    scanned = 0
-    try:
-        target_rows = [
-            row for row in viewer._base_selected_segments()
-            if viewer.segment_group_by_idx.get(int(row["segment_idx"])) in {"likely-clean", "likely-artifact"}
-        ]
-        print(f"Auto-applying v rule to {len(target_rows)} likely-clean/likely-artifact segments", flush=True)
-        viewer.action_logger.log("auto_apply_v_to_likely_start", details={"segments": len(target_rows)})
-        for seg in target_rows:
-            scanned += 1
-            seg_idx = int(seg["segment_idx"])
-            viewer.visible_segments = [seg]
-            viewer.index = 0
-            viewer.view_lo_ms = None
-            viewer.view_hi_ms = None
-            viewer._load_window(reset_view=True)
-            points = [p for p in viewer._make_points() if p.label != "artifact"]
-            candidates = low_amplitude_artifact_candidates(points)
-            if not candidates:
-                continue
-            changed_segments += 1
-            segment_changes: list[dict[str, Any]] = []
-            for point in candidates:
-                before, after = viewer._upsert_beat_label(point, "artifact", "spurious")
-                change = {"point": point.__dict__, "before": before, "after": after}
-                segment_changes.append(change)
-                total_candidates += 1
-                viewer.action_logger.log("auto_batch_v_artifact_marked", segment_idx=seg_idx, details=change)
-            viewer._refresh_segment_group(seg_idx)
-            viewer.action_logger.log(
-                "auto_batch_v_segment_complete",
-                segment_idx=seg_idx,
-                details={"marked": len(segment_changes), "changes": segment_changes},
-            )
-        if total_candidates:
-            viewer._save_beats_output()
-        summary = {
-            "scanned_segments": scanned,
-            "changed_segments": changed_segments,
-            "marked_artifacts": total_candidates,
-        }
-        viewer.action_logger.log("auto_apply_v_to_likely_done", details=summary)
-        print(
-            "Auto v pass complete: "
-            f"scanned {scanned}, changed {changed_segments}, marked {total_candidates} artifacts",
-            flush=True,
-        )
-    finally:
-        viewer.action_logger.close()
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="V4 ECG annotation viewer")
     parser.add_argument("--reviewed", action="store_true", help="Only show reviewed segments")
     parser.add_argument("--physio", action="store_true", help="Only show segments containing physio-labeled beats")
+    parser.add_argument("--markers", action="store_true", help="Show real segment queues spanning ±15 segments around marker CSV timestamps")
+    parser.add_argument("--marker-recovery", action="store_true", help="Review the recovered marker-session segments from Diagnostics without entering marker-center mode")
+    parser.add_argument(
+        "--physio-review",
+        action="store_true",
+        help="Review physio-constraint flagged beats from the diagnostics parquet, centered with a faint shaded beat overlay.",
+    )
     parser.add_argument("--usable", action="store_true", help="Only show segments with segment_quality_label == 'usable'")
     parser.add_argument("--unclean", action="store_true", help="Only show segments with segment_quality_label == 'unclean'")
     parser.add_argument("--unusable", action="store_true", help="Only show segments with segment_quality_label == 'unusable'")
+    parser.add_argument(
+        "--chronological",
+        dest="spread_queue",
+        action="store_false",
+        default=True,
+        help="Show selected rows in chronological order instead of spreading them across dates.",
+    )
     queue_group = parser.add_mutually_exclusive_group()
     queue_group.add_argument("--annotated", action="store_true", help="Only show segments that already contain beat/bad-region annotations")
     queue_group.add_argument("--likely-artifact", action="store_true", help="Only show unannotated segments with high RMSSD or RR < threshold")
     queue_group.add_argument("--likely-physio", action="store_true", help="Only show unannotated segments with a large positive delta-RR")
     queue_group.add_argument("--likely-clean", action="store_true", help="Only show unannotated segments not flagged by artifact/physio heuristics")
-    parser.add_argument("--rmssd-artifact-ms", type=float, default=DEFAULT_RMSSD_ARTIFACT_MS, help="RMSSD threshold for --likely-artifact")
-    parser.add_argument("--min-rr-artifact-ms", type=int, default=DEFAULT_MIN_RR_ARTIFACT_MS, help="RR intervals below this threshold flag --likely-artifact")
-    parser.add_argument("--physio-delta-ms", type=int, default=DEFAULT_PHYSIO_DELTA_MS, help="Positive delta-RR threshold for --likely-physio")
+    parser.add_argument("--rmssd", type=float, default=DEFAULT_RMSSD_ARTIFACT_MS, help="RMSSD threshold for --likely-artifact")
+    parser.add_argument("--min-rr", type=int, default=DEFAULT_MIN_RR_ARTIFACT_MS, help="RR intervals below this threshold flag --likely-artifact")
+    parser.add_argument("--delta", type=int, default=DEFAULT_PHYSIO_DELTA_MS, help="Positive delta-RR threshold for --likely-physio")
     parser.add_argument("--start", type=int, default=0, help="0-based starting index within the selected queue")
-    parser.add_argument("--ecg-dir", type=Path, default=DEFAULT_ECG_DIR, help="Raw ECG directory, retained for provenance")
-    parser.add_argument("--peak-dir", type=Path, default=DEFAULT_PEAK_DIR, help="Raw peak directory, retained for provenance")
-    parser.add_argument("--show-empty", action="store_true", help="Do not skip selected windows with no ECG rows")
     parser.add_argument(
-        "--auto-apply-v-to-likely",
-        action="store_true",
-        help="Apply the v low-amplitude artifact rule to likely-clean and likely-artifact segments, write beats, and exit",
+        "--window-size",
+        type=float,
+        default=None,
+        help="Visible/load window size in seconds, centered on the active segment/review beat. Default is the segment width; physio-review defaults to 12 seconds.",
     )
     return parser.parse_args()
 
@@ -2053,9 +2971,6 @@ def main() -> None:
         if not required.exists():
             _die(f"Missing required file: {required}")
     ensure_inputs()
-    if args.auto_apply_v_to_likely:
-        auto_apply_v_to_likely(args)
-        return
     require_matplotlib()
     viewer = MasterAnnotationViewer(args)
     viewer.show()
